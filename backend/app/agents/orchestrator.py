@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ..config import ARTIFACTS_DIR, PROJECTS_DIR, settings
+from ..config import ARTIFACTS_DIR, PROJECTS_DIR, get_runtime_env, settings
 from ..event_bus import EventBus
 from ..models import (
     AgentLocation,
@@ -20,6 +20,7 @@ from ..models import (
     ProjectCreate,
     ProjectPhase,
     ProjectState,
+    SpecSectionItem,
     TaskItem,
     build_default_agents,
     utc_now_iso,
@@ -32,6 +33,11 @@ from ..offline.source_scaffold import (
     build_demo_preview_site,
     generate_demo_seed_data,
     inspect_workspace_context,
+)
+from ..offline.spec_parser import (
+    parse_ai_sections_from_reply,
+    reconcile_figma_and_spec,
+    render_structured_plan_markdown,
 )
 from .prompts import build_agent_system_instructions
 from .sdk_adapter import AntigravityAgentRunner
@@ -62,13 +68,24 @@ class OfficeOrchestrator:
         workspace_ctx = inspect_workspace_context(req.target_source_dir)
         self._ephemeral_workspace[project_id] = workspace_ctx
 
-        token = (req.figma_token or settings.FIGMA_ACCESS_TOKEN or "").strip()
+        token = (
+            req.figma_token
+            or get_runtime_env("FIGMA_ACCESS_TOKEN")
+            or settings.FIGMA_ACCESS_TOKEN
+            or ""
+        ).strip()
         if token:
             self._ephemeral_figma_tokens[project_id] = token
 
+        resolved_name = (req.name or "").strip()
+        if not resolved_name and req.target_source_dir.strip():
+            resolved_name = Path(req.target_source_dir.strip()).name
+        if not resolved_name:
+            resolved_name = "Untitled Web Project"
+
         state = ProjectState(
             id=project_id,
-            name=req.name,
+            name=resolved_name,
             spec_text=req.spec_text,
             figma_url=req.figma_url,
             target_source_dir=req.target_source_dir,
@@ -284,44 +301,13 @@ class OfficeOrchestrator:
         tokens_data: dict[str, Any],
         workspace_ctx: dict[str, Any],
     ) -> str:
-        stats = tokens_data.get("stats") or {}
-        colors = tokens_data.get("colors") or []
-        color_list = ", ".join(
-            f"{c.get('name', 'Color')} ({c.get('hex', '')})" for c in colors[:6]
-        ) or "#1d4ed8, #0f766e"
-        fonts = ", ".join(tokens_data.get("fonts") or ["Be Vietnam Pro"])
-        sections = tokens_data.get("sections") or []
-        section_lines = "\n".join(
-            f"  {idx + 1}. **{sec.get('name', f'Section {idx + 1}')}**"
-            + (f" — {sec.get('role')}" if sec.get("role") else "")
-            for idx, sec in enumerate(sections)
-        ) or "  1. Header, Hero Banner, Danh mục nổi bật, Giới thiệu & Footer Form"
-
-        nasanic_rule = (
-            "Tuân thủ CSS Nasanic (CẤM dùng `aspect-ratio`, tách rõ `fonts.css` / `style.css` / `media.css`)"
-            if workspace_ctx.get("framework") == "nasanic"
-            else "Tuân thủ HTML5 semantic & Vanilla CSS sạch"
-        )
-        return (
-            f"# ĐẶC TẢ PHÂN TÍCH DỰ ÁN: {state.name}\n\n"
-            f"## 1. Nguồn thiết kế & Môi trường\n"
-            f"- Figma File: {tokens_data.get('file_name') or 'Demo Design System'} "
-            f"(Nén {stats.get('compression_pct', 0)}% node rác: {stats.get('kept_node_count', 0)}/{stats.get('raw_node_count', 0)} nodes)\n"
-            f"- Framework phát hiện: `{workspace_ctx.get('framework', 'generic')}`\n"
-            f"- Bảng màu Tokens: {color_list}\n"
-            f"- Typography: {fonts}\n\n"
-            f"## 2. Cấu trúc Section trích xuất từ Figma\n"
-            f"{section_lines}\n\n"
-            f"## 3. Yêu cầu chi tiết từ Đặc tả gốc\n"
-            f"{state.spec_text.strip()}\n\n"
-            f"## 4. Ràng buộc kỹ thuật & Responsive\n"
-            f"- {nasanic_rule}\n"
-            f"- Tối ưu toàn bộ hình ảnh sang `.webp` + SVG icon sắc nét.\n"
-            f"- Responsive chuẩn 3 màn hình kiểm thử: Desktop `1440px`, Tablet `768px`, Mobile `375px` (không tràn ngang).\n\n"
-            f"## 5. Kế hoạch triển khai 3 nhân viên\n"
-            f"- **Linh (`asset`)**: Cấu hình source `{workspace_ctx.get('framework', 'generic')}`, sinh `fonts.css`, nén ảnh WebP & tạo `seed.json` tiếng Việt.\n"
-            f"- **Vy (`dev`)**: Code HTML/Blade, Vanilla CSS, JS & responsive theo đúng đặc tả đã duyệt.\n"
-            f"- **Tuấn (`qa`)**: Chạy Static Lint + Playwright 3 viewports để bắt lỗi và đưa lên Bug Board."
+        return render_structured_plan_markdown(
+            state.name,
+            tokens_data,
+            workspace_ctx,
+            state.spec_sections,
+            state.spec_metadata,
+            state.spec_global_features,
         )
 
     async def _run_leader_analysis(self, project_id: str) -> None:
@@ -391,28 +377,97 @@ class OfficeOrchestrator:
                 edited_file="tokens.json",
             )
 
+            reconciled = reconcile_figma_and_spec(tokens_data, state.spec_text)
+            state.spec_sections = [
+                SpecSectionItem(**sec) for sec in reconciled["spec_sections"]
+            ]
+            state.spec_metadata = reconciled["spec_metadata"]
+            state.spec_global_features = reconciled["spec_global_features"]
+            (project_dir / "spec_sections.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": state.spec_metadata,
+                        "sections": [s.model_dump(mode="json") for s in state.spec_sections],
+                        "global_features": state.spec_global_features,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
             default_plan = self._build_default_leader_plan_markdown(
                 state, tokens_data, workspace_ctx
             )
             if state.mode == "live_sdk":
                 plan_prompt = (
-                    f"Phân tích đặc tả gốc và Figma tokens bên dưới, xuất ra bản ĐẶC TẢ KỸ THUẬT CHI TIẾT bằng tiếng Việt (Markdown) "
-                    f"để người dùng xem, chỉnh sửa và duyệt trước khi giao cho 3 nhân viên: Linh (Assets/Config/Seed), Vy (UI/Frontend), Tuấn (QA).\n"
+                    f"Phân tích theo thứ tự: DỰA TRÊN FIGMA TRƯỚC rồi đối chiếu với file đặc tả gốc.\n"
+                    f"QUAN TRỌNG: Chỉ phân tích tập trung vào 2 nhóm chính:\n"
+                    f"  1) Các mục trên Menu (scope='menu': Giới thiệu, Sản phẩm, Dịch vụ, Tin tức, Liên hệ...)\n"
+                    f"  2) Các mục lớn ở Trang chủ (scope='homepage': Header, Slide, Tiêu chí, Giới thiệu, Sản phẩm nổi bật, Dịch vụ, Album, Vì sao chọn, Tin tức, Liên hệ, Footer...)\n"
+                    f"TUYỆT ĐỐI KHÔNG tạo card cho các phần tử nhỏ lẻ như Hotline, Email, Địa chỉ, Frame 1, SP 1, Tab hoặc các gạch đầu dòng SEO/PHP (đưa các yêu cầu kỹ thuật/SEO chung vào `spec_global_features`).\n"
+                    f"BẮT BUỘC trả về một khối ```json ... ``` hợp lệ có cấu trúc:\n"
+                    f'{{\n'
+                    f'  "spec_sections": [\n'
+                    f'    {{\n'
+                    f'      "id": "sec-1",\n'
+                    f'      "order": 1,\n'
+                    f'      "name": "Tên mục",\n'
+                    f'      "scope": "menu | homepage | inner_page | global",\n'
+                    f'      "source": "figma_and_spec | figma_only | spec_only",\n'
+                    f'      "figma_section_name": "Tên frame Figma nếu có",\n'
+                    f'      "content_type": "product | article_single | article_list | album | video | form | layout | feature",\n'
+                    f'      "category_levels": 0,\n'
+                    f'      "item_cardinality": "single | multiple | none",\n'
+                    f'      "spec_requirements": "Yêu cầu chi tiết của riêng mục này",\n'
+                    f'      "notes": "Ghi chú ẩn/hiện giá, đóng dấu logo, slider, popup, link tham khảo"\n'
+                    f'    }}\n'
+                    f'  ],\n'
+                    f'  "spec_global_features": ["Yêu cầu chung / SEO / Hotline / Mạng xã hội..."]\n'
+                    f'}}\n'
                     f"Framework phát hiện: {workspace_ctx['framework']}\n"
-                    f"Đặc tả gốc:\n{state.spec_text}\n\n"
-                    f"Figma Tokens:\n{json.dumps(tokens_data, ensure_ascii=False)[:3200]}"
+                    f"Các mục sơ bộ đã đối chiếu Figma → Đặc tả (hãy kiểm tra, phân tách/tinh chỉnh lại cho chuẩn):\n"
+                    f"{json.dumps([s.model_dump(mode='json') for s in state.spec_sections], ensure_ascii=False)[:3200]}\n\n"
+                    f"Đặc tả gốc:\n{state.spec_text[:3000]}\n\n"
+                    f"Figma Tokens:\n{json.dumps(tokens_data, ensure_ascii=False)[:2400]}"
                 )
                 try:
                     leader_reply = await self._run_sdk_with_fallback(
                         state, "leader", plan_prompt, state.target_source_dir
                     )
+                    ai_sections, ai_global, md_override = parse_ai_sections_from_reply(
+                        leader_reply,
+                        [s.model_dump(mode="json") for s in state.spec_sections],
+                        state.spec_global_features,
+                    )
+                    state.spec_sections = [SpecSectionItem(**s) for s in ai_sections]
+                    state.spec_global_features = ai_global
+                    (project_dir / "spec_sections.json").write_text(
+                        json.dumps(
+                            {
+                                "metadata": state.spec_metadata,
+                                "sections": [s.model_dump(mode="json") for s in state.spec_sections],
+                                "global_features": state.spec_global_features,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
                     state.leader_plan_markdown = (
-                        leader_reply.strip() if len(leader_reply.strip()) >= 40 else default_plan
+                        md_override
+                        if md_override
+                        else self._build_default_leader_plan_markdown(
+                            state, tokens_data, workspace_ctx
+                        )
                     )
                     await self._update_agent(
                         state,
                         "leader",
-                        thought=f"Đã phân tích đặc tả qua AI SDK ({len(state.leader_plan_markdown)} ký tự). Chờ bạn duyệt.",
+                        thought=(
+                            f"Đã phân tích đặc tả qua AI SDK ({len(state.spec_sections)} mục) "
+                            f"và cập nhật danh sách card từng mục. Chờ bạn xem/sửa và duyệt."
+                        ),
                     )
                 except Exception as sdk_exc:
                     await self._handle_sdk_error(state, "leader", sdk_exc)
@@ -506,7 +561,57 @@ class OfficeOrchestrator:
 
         project_dir = PROJECTS_DIR / project_id
         project_dir.mkdir(parents=True, exist_ok=True)
-        state.leader_plan_markdown = req.leader_plan_markdown.strip()
+        workspace_ctx = self._ephemeral_workspace.get(project_id) or inspect_workspace_context(
+            state.target_source_dir
+        )
+        tokens_data = self._ephemeral_tokens_data.get(project_id)
+        if not tokens_data and (project_dir / "tokens.json").exists():
+            tokens_data = json.loads((project_dir / "tokens.json").read_text(encoding="utf-8"))
+
+        if req.spec_sections is not None:
+            normalized_sections: list[SpecSectionItem] = []
+            for idx, item in enumerate(req.spec_sections, start=1):
+                item_data = item.model_dump()
+                item_data["order"] = idx
+                if not item_data.get("id"):
+                    item_data["id"] = f"sec-{idx}"
+                normalized_sections.append(SpecSectionItem(**item_data))
+            state.spec_sections = normalized_sections
+
+        if req.spec_global_features is not None:
+            state.spec_global_features = [
+                f.strip() for f in req.spec_global_features if f.strip()
+            ]
+
+        if req.spec_sections is not None or req.spec_global_features is not None:
+            (project_dir / "spec_sections.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": state.spec_metadata,
+                        "sections": [s.model_dump(mode="json") for s in state.spec_sections],
+                        "global_features": state.spec_global_features,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        if req.leader_plan_markdown.strip():
+            state.leader_plan_markdown = req.leader_plan_markdown.strip()
+        elif state.spec_sections:
+            state.leader_plan_markdown = render_structured_plan_markdown(
+                state.name,
+                tokens_data or {},
+                workspace_ctx,
+                state.spec_sections,
+                state.spec_metadata,
+                state.spec_global_features,
+            )
+
+        if not state.leader_plan_markdown.strip() and not state.spec_sections:
+            raise ValueError("Cần có nội dung đặc tả hoặc danh sách mục trước khi duyệt")
+
         (project_dir / "leader_plan.md").write_text(
             state.leader_plan_markdown, encoding="utf-8"
         )
@@ -669,6 +774,7 @@ class OfficeOrchestrator:
                     f"Triển khai giao diện HTML/Blade, Vanilla CSS (`assets/css/style.css`, `assets/css/media.css`) "
                     f"và JS (`assets/js/apps.js`) chuẩn dự án {workspace_ctx['framework']}.\n"
                     f"ĐẶC TẢ ĐÃ DUYỆT:\n{approved_spec}\n\n"
+                    f"File đặc tả từng mục (loại sản phẩm/bài viết, 1/nhiều bài, cấp danh mục): `{project_dir / 'spec_sections.json'}`\n"
                     f"Tài nguyên Linh đã tạo sẵn trong `{preview_dir}`:\n"
                     f"- Font CSS: `{assets_manifest['fonts_css']}` (Fonts: {', '.join(tokens_data.get('fonts', []))})\n"
                     f"- Ảnh WebP: {', '.join(assets_manifest.get('images', []))}\n"

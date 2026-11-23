@@ -44,17 +44,45 @@ ProjectPhase = Literal[
 AgentLocation = Literal["desk", "leader_desk", "bug_board", "lounge"]
 ExecutionKind = Literal["offline", "ai", "idle"]
 
+SpecContentType = Literal[
+    "product",
+    "article_single",
+    "article_list",
+    "album",
+    "video",
+    "form",
+    "layout",
+    "feature",
+]
+SpecSectionScope = Literal["menu", "homepage", "inner_page", "global"]
+SpecSectionSource = Literal["figma_and_spec", "figma_only", "spec_only"]
+SpecCardinality = Literal["single", "multiple", "none"]
+
+
+class SpecSectionItem(BaseModel):
+    id: str
+    order: int = 1
+    name: str
+    scope: SpecSectionScope = "homepage"
+    source: SpecSectionSource = "figma_and_spec"
+    figma_section_name: str = ""
+    content_type: SpecContentType = "layout"
+    category_levels: int = Field(default=0, ge=0, le=3)
+    item_cardinality: SpecCardinality = "none"
+    spec_requirements: str = ""
+    notes: str = ""
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 class ProjectCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=120)
+    name: str = Field(default="", max_length=120)
     spec_text: str = Field(..., min_length=1)
     figma_url: str = Field(default="")
     figma_token: Optional[str] = Field(default=None)
-    target_source_dir: str = Field(default=r"f:\RBWStudio\www\2026_11\source_nasani_29102026")
+    target_source_dir: str = Field(default="")
     preview_url: Optional[str] = Field(default=None)
     mode: Literal["demo", "live_sdk"] = "demo"
     enable_ai_vision_qa: bool = False
@@ -126,7 +154,9 @@ class PlanTaskUpdate(BaseModel):
 
 
 class PlanApprovalRequest(BaseModel):
-    leader_plan_markdown: str = Field(..., min_length=1)
+    leader_plan_markdown: str = Field(default="")
+    spec_sections: Optional[list[SpecSectionItem]] = None
+    spec_global_features: Optional[list[str]] = None
     tasks: Optional[list[PlanTaskUpdate]] = None
     user_note: str = ""
 
@@ -155,6 +185,9 @@ class ProjectState(BaseModel):
     phase: ProjectPhase = "idle"
     qa_round: int = 0
     leader_plan_markdown: str = ""
+    spec_sections: list[SpecSectionItem] = Field(default_factory=list)
+    spec_metadata: dict[str, str] = Field(default_factory=dict)
+    spec_global_features: list[str] = Field(default_factory=list)
     plan_approved: bool = False
     plan_review_note: str = ""
     token_stats: TokenStats = Field(default_factory=TokenStats)

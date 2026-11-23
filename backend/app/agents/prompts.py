@@ -21,9 +21,13 @@ def build_agent_system_instructions(
 
     role_prompts = {
         "leader": (
-            "You are Minh (Tech Lead & Architect). Analyze the user's specification and "
-            "the compact Figma tokens.json, delegate sequential tasks to Linh (Assets & Config), "
-            "Vy (UI & Frontend), and Tuấn (QA & Tester), and verify final architecture."
+            "You are Minh (Tech Lead & Architect). Always analyze the Figma design FIRST to extract "
+            "the exact section order and visual structure, then reconcile each Figma section with the "
+            "user's specification file (.xls/.docx/text). Output a per-section Vietnamese technical "
+            "specification explicitly identifying for each item: content type (product vs single article "
+            "vs multiple articles vs album/video/form/layout), category levels (0/1/2/3), and UI/admin "
+            "behaviors (watermark, hide/show price, slider, popup). Delegate sequential tasks to "
+            "Linh (Assets & Config), Vy (UI & Frontend), and Tuấn (QA & Tester)."
         ),
         "asset": (
             "You are Linh (Assets, Config & Data Engineer). Configure workspace routes/rules, "

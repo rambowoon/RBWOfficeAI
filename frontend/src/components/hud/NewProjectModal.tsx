@@ -1,10 +1,17 @@
-import { FileText, Sparkles, Upload, X } from "lucide-react";
-import { useRef, useState } from "react";
+import { FileText, FolderOpen, Sparkles, Upload, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useOfficeStore } from "../../store/officeStore";
 
 const PRESET_SPEC = `- Landing page doanh nghiệp Nội thất & Kiến trúc Nasanic Studio.
 - Các section bắt buộc: Header cố định, Hero Banner kèm 2 nút CTA, Danh mục 3 gói dịch vụ nổi bật, Giới thiệu uy tín & checklist cam kết, Footer kèm Form đăng ký tư vấn.
 - Yêu cầu kỹ thuật: Tuân thủ CSS Nasanic (không dùng aspect-ratio), responsive chuẩn Desktop 1440 / Tablet 768 / Mobile 375, hình ảnh tối ưu WebP.`;
+
+function folderBasename(pathStr: string): string {
+  const cleaned = pathStr.trim().replace(/[\\/]+$/, "");
+  if (!cleaned) return "";
+  const parts = cleaned.split(/[\\/]/);
+  return parts[parts.length - 1] || "";
+}
 
 export function NewProjectModal() {
   const show = useOfficeStore((s) => s.showNewProjectModal);
@@ -13,22 +20,29 @@ export function NewProjectModal() {
   const isSubmitting = useOfficeStore((s) => s.isSubmitting);
   const lastError = useOfficeStore((s) => s.lastError);
   const health = useOfficeStore((s) => s.health);
+  const fetchHealth = useOfficeStore((s) => s.fetchHealth);
 
-  const [name, setName] = useState("Nasanic Landing Demo");
+  const [specContractName, setSpecContractName] = useState("");
   const [specText, setSpecText] = useState(PRESET_SPEC);
   const [figmaUrl, setFigmaUrl] = useState(
     "https://www.figma.com/design/DEMOKEY123/Nasanic-Landing?node-id=10-101"
   );
   const [figmaToken, setFigmaToken] = useState("");
-  const [targetSourceDir, setTargetSourceDir] = useState(
-    health?.default_source_dir || "f:\\RBWStudio\\www\\2026_11\\source_nasani_29102026"
-  );
+  const [targetSourceDir, setTargetSourceDir] = useState("");
+  const [pickingFolder, setPickingFolder] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [mode, setMode] = useState<"demo" | "live_sdk">("demo");
   const [enableAiVision, setEnableAiVision] = useState(false);
   const [uploadingSpec, setUploadingSpec] = useState(false);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (show) {
+      void fetchHealth();
+    }
+  }, [show, fetchHealth]);
 
   if (!show) return null;
 
@@ -49,7 +63,18 @@ export function NewProjectModal() {
         throw new Error(data.detail || "Không đọc được file đặc tả");
       }
       setSpecText(data.text || "");
-      setUploadNotice(`Đã nạp đặc tả từ ${data.filename}`);
+      const sectionCount = Array.isArray(data.structured?.items)
+        ? data.structured.items.length
+        : 0;
+      const contractName = data.structured?.metadata?.contract_name;
+      if (typeof contractName === "string" && contractName.trim()) {
+        setSpecContractName(contractName.trim());
+      }
+      setUploadNotice(
+        sectionCount > 0
+          ? `Đã nạp đặc tả từ ${data.filename} (${sectionCount} mục)`
+          : `Đã nạp đặc tả từ ${data.filename}`
+      );
     } catch (err) {
       setUploadNotice(err instanceof Error ? err.message : "Lỗi đọc file");
     } finally {
@@ -58,10 +83,36 @@ export function NewProjectModal() {
     }
   };
 
+  const handlePickFolder = async () => {
+    setPickingFolder(true);
+    setLocalError(null);
+    try {
+      const res = await fetch("/api/workspace/pick-folder", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || "Không mở được hộp thoại chọn thư mục");
+      }
+      if (data.path) {
+        setTargetSourceDir(data.path);
+      }
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "Lỗi chọn thư mục");
+    } finally {
+      setPickingFolder(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setLocalError(null);
+    if (mode === "live_sdk" && !targetSourceDir.trim()) {
+      setLocalError("Vui lòng chọn Source dự án trước khi chạy Live Antigravity SDK.");
+      return;
+    }
+    const derivedName =
+      folderBasename(targetSourceDir) || specContractName || "Nasanic Demo Project";
     await createProject({
-      name: name.trim() || "Untitled Web Project",
+      name: derivedName,
       spec_text: specText.trim(),
       figma_url: figmaUrl.trim(),
       figma_token: figmaToken.trim() || undefined,
@@ -120,15 +171,39 @@ export function NewProjectModal() {
           </button>
         </div>
 
-        <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
-          <span>Tên dự án</span>
-          <input
-            required
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            style={inputStyle}
-          />
-        </label>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
+          <span>Source dự án</span>
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              value={targetSourceDir}
+              onChange={(e) => setTargetSourceDir(e.target.value)}
+              placeholder="Chọn thư mục dự án (VD: d:\RBWStudio\www\ten_du_an)..."
+              style={{ ...inputStyle, flex: 1 }}
+            />
+            <button
+              type="button"
+              disabled={pickingFolder}
+              onClick={handlePickFolder}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                fontSize: 11,
+                fontWeight: 700,
+                background: "rgba(56,189,248,0.16)",
+                color: "#7dd3fc",
+                border: "1px solid rgba(56,189,248,0.4)",
+                borderRadius: 8,
+                padding: "0 12px",
+                cursor: pickingFolder ? "wait" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              <FolderOpen size={13} />
+              {pickingFolder ? "Đang mở..." : "Chọn source"}
+            </button>
+          </div>
+        </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -137,7 +212,7 @@ export function NewProjectModal() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".docx,.xlsx,.txt,.md,.csv"
+                accept=".xls,.xlsx,.docx,.txt,.md,.csv"
                 onChange={handleSpecFileChange}
                 style={{ display: "none" }}
               />
@@ -159,7 +234,7 @@ export function NewProjectModal() {
                 }}
               >
                 <Upload size={12} />
-                {uploadingSpec ? "Đang đọc file..." : "Tải Word / Excel (.docx, .xlsx)"}
+                {uploadingSpec ? "Đang đọc file..." : "Tải Word / Excel (.docx, .xls, .xlsx)"}
               </button>
               <button
                 type="button"
@@ -205,36 +280,37 @@ export function NewProjectModal() {
             />
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
-            <span>Figma Token (tuỳ chọn, không lưu ổ cứng)</span>
+            <span style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+              <span>Figma Token (tuỳ chọn)</span>
+              {health?.figma_token_configured && (
+                <span style={{ fontSize: 10, color: "#34d399", fontWeight: 700 }}>
+                  Đã lấy từ .env
+                </span>
+              )}
+            </span>
             <input
               type="password"
               value={figmaToken}
               onChange={(e) => setFigmaToken(e.target.value)}
-              placeholder="figd_... (để trống nếu test Demo)"
+              placeholder={
+                health?.figma_token_configured
+                  ? "Đã cấu hình sẵn trong backend/.env (để trống để dùng luôn)"
+                  : "figd_... (để trống nếu test Demo hoặc đã lưu .env)"
+              }
               style={inputStyle}
             />
           </label>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
-            <span>Thư mục Source gốc</span>
-            <input
-              value={targetSourceDir}
-              onChange={(e) => setTargetSourceDir(e.target.value)}
-              style={inputStyle}
-            />
-          </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
-            <span>URL Preview (để trống = Sandbox tự động)</span>
-            <input
-              value={previewUrl}
-              onChange={(e) => setPreviewUrl(e.target.value)}
-              placeholder="http://localhost:8000 (tuỳ chọn)"
-              style={inputStyle}
-            />
-          </label>
-        </div>
+        <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
+          <span>URL Preview (để trống = Sandbox tự động)</span>
+          <input
+            value={previewUrl}
+            onChange={(e) => setPreviewUrl(e.target.value)}
+            placeholder="http://localhost:8000 (tuỳ chọn)"
+            style={inputStyle}
+          />
+        </label>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 12 }}>
           <span>Chế độ vận hành</span>
@@ -296,7 +372,7 @@ export function NewProjectModal() {
           <span>Bật AI Vision QA ở bước cuối (mặc định tắt để tiết kiệm token)</span>
         </label>
 
-        {lastError && (
+        {(localError || lastError) && (
           <div
             style={{
               padding: "8px 10px",
@@ -307,7 +383,7 @@ export function NewProjectModal() {
               fontSize: 12,
             }}
           >
-            {lastError}
+            {localError || lastError}
           </div>
         )}
 

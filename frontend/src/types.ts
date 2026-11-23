@@ -107,8 +107,38 @@ export interface PlanTaskUpdate {
   detail: string;
 }
 
+export type SpecContentType =
+  | "product"
+  | "article_single"
+  | "article_list"
+  | "album"
+  | "video"
+  | "form"
+  | "layout"
+  | "feature";
+
+export type SpecSectionScope = "menu" | "homepage" | "inner_page" | "global";
+export type SpecSectionSource = "figma_and_spec" | "figma_only" | "spec_only";
+export type SpecCardinality = "single" | "multiple" | "none";
+
+export interface SpecSectionItem {
+  id: string;
+  order: number;
+  name: string;
+  scope: SpecSectionScope;
+  source: SpecSectionSource;
+  figma_section_name: string;
+  content_type: SpecContentType;
+  category_levels: number;
+  item_cardinality: SpecCardinality;
+  spec_requirements: string;
+  notes: string;
+}
+
 export interface PlanApprovalRequest {
   leader_plan_markdown: string;
+  spec_sections?: SpecSectionItem[];
+  spec_global_features?: string[];
   tasks?: PlanTaskUpdate[];
   user_note: string;
 }
@@ -133,6 +163,9 @@ export interface ProjectState {
   phase: ProjectPhase;
   qa_round: number;
   leader_plan_markdown: string;
+  spec_sections?: SpecSectionItem[];
+  spec_metadata?: Record<string, string>;
+  spec_global_features?: string[];
   plan_approved: boolean;
   plan_review_note: string;
   token_stats: TokenStats;
@@ -152,6 +185,7 @@ export interface ProjectState {
 export interface HealthInfo {
   ok: boolean;
   sdk: { available: boolean; detail: string };
+  figma_token_configured?: boolean;
   playwright_ready: boolean;
   default_source_dir: string;
 }

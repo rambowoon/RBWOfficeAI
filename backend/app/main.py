@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -10,10 +12,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .agents.orchestrator import OfficeOrchestrator
 from .agents.sdk_adapter import check_sdk_status
-from .config import ARTIFACTS_DIR, PROJECTS_DIR, settings
+from .config import ARTIFACTS_DIR, PROJECTS_DIR, get_runtime_env, settings
 from .event_bus import EventBus
 from .models import AgentChatRequest, BugReviewRequest, PlanApprovalRequest, ProjectCreate
-from .offline.spec_parser import parse_spec_upload
+from .offline.spec_parser import parse_spec_upload, parse_structured_spec
 
 bus = EventBus()
 orchestrator = OfficeOrchestrator(bus=bus)
@@ -37,6 +39,7 @@ async def health() -> dict:
     return {
         "ok": True,
         "sdk": check_sdk_status(),
+        "figma_token_configured": bool(get_runtime_env("FIGMA_ACCESS_TOKEN")),
         "playwright_ready": True,
         "default_source_dir": settings.DEFAULT_SOURCE_DIR,
     }
@@ -66,11 +69,44 @@ async def parse_spec_file(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Không đọc được file: {exc}")
-    return {"filename": file.filename, "text": text}
+    return {
+        "filename": file.filename,
+        "text": text,
+        "structured": parse_structured_spec(text),
+    }
+
+
+def _open_folder_dialog() -> str:
+    """Open native Windows folder picker dialog and return normalized path (or empty string)."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        selected = filedialog.askdirectory(title="Chọn thư mục Source gốc")
+    finally:
+        root.destroy()
+    return os.path.normpath(selected) if selected else ""
+
+
+@app.post("/api/workspace/pick-folder")
+async def pick_workspace_folder() -> dict:
+    try:
+        selected = await asyncio.to_thread(_open_folder_dialog)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Không mở được hộp thoại chọn thư mục: {exc}")
+    return {"path": selected, "cancelled": not bool(selected)}
 
 
 @app.post("/api/projects", status_code=201)
 async def create_project(req: ProjectCreate) -> dict:
+    if req.mode == "live_sdk" and not req.target_source_dir.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Vui lòng chọn Source dự án trước khi chạy chế độ Live SDK.",
+        )
     state = await orchestrator.create_and_start(req)
     return state.model_dump(mode="json")
 

@@ -42,14 +42,93 @@ def _slugify(value: str) -> str:
     return value.strip("-") or "asset"
 
 
+_JUNK_FRAME_NAMES = {
+    "demo",
+    "home",
+    "homepage",
+    "trang chu",
+    "desktop",
+    "page",
+    "hotline",
+    "email",
+    "mail",
+    "diachi",
+    "dia chi",
+    "address",
+    "phone",
+    "sdt",
+    "tab",
+    "icon",
+    "logo",
+    "btn",
+    "button",
+    "search",
+    "tim kiem",
+    "social",
+    "mxh",
+}
+
+
+def is_junk_section_name(name: str) -> bool:
+    low = re.sub(r"\s+", " ", (name or "").strip().lower())
+    if not low:
+        return True
+    if low in _JUNK_FRAME_NAMES:
+        return True
+    if re.fullmatch(
+        r"(?:frame|group|rectangle|ellipse|vector|line|sp|item|card|box|img|image)\s*\d*",
+        low,
+    ):
+        return True
+    return False
+
+
+def _collect_texts(node: dict[str, Any], out: list[dict[str, Any]], max_items: int = 80) -> None:
+    if len(out) >= max_items or not isinstance(node, dict) or node.get("visible") is False:
+        return
+    if node.get("type") == "TEXT":
+        chars = " ".join(str(node.get("characters") or "").split()).strip()
+        if chars:
+            bbox = node.get("absoluteBoundingBox") or {}
+            style = node.get("style") or {}
+            out.append(
+                {
+                    "text": chars,
+                    "x": float(bbox.get("x") or 0),
+                    "y": float(bbox.get("y") or 0),
+                    "fontSize": float(style.get("fontSize") or 14),
+                }
+            )
+    for child in node.get("children") or []:
+        _collect_texts(child, out, max_items)
+
+
+def _extract_heading_text(node: dict[str, Any]) -> str:
+    texts: list[dict[str, Any]] = []
+    _collect_texts(node, texts, max_items=40)
+    candidates = [
+        t
+        for t in texts
+        if 3 <= len(t["text"]) <= 55
+        and t["fontSize"] >= 18
+        and "@" not in t["text"]
+        and not re.fullmatch(r"[\d\s.+()-]+", t["text"])
+    ]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda t: (-t["fontSize"], t["y"]))
+    return candidates[0]["text"]
+
+
 def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
     """
     Strip invisible/junk nodes and extract deduplicated colors, fonts,
-    sections, and exportable image node IDs from a raw Figma REST payload.
+    menu items, major homepage sections, and exportable image node IDs.
     """
     colors: dict[str, int] = {}
     typography: dict[tuple[str, float, int], dict[str, Any]] = {}
-    sections: list[dict[str, Any]] = []
+    raw_sections: list[dict[str, Any]] = []
+    menu_items: list[str] = []
     export_nodes: list[dict[str, str]] = []
     stats = {"raw_node_count": 0, "kept_node_count": 0}
 
@@ -74,8 +153,10 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
         bbox = node.get("absoluteBoundingBox") or {}
         width = bbox.get("width")
         height = bbox.get("height")
+        y_pos = float(bbox.get("y") or 0)
         node_type = str(node.get("type", ""))
         node_name = str(node.get("name", "")).strip()
+        norm_name = node_name.lower()
 
         # Skip degenerate empty shapes that carry no text, children, or image fills
         if (
@@ -124,17 +205,47 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
                         "lineHeightPx": round(float(style.get("lineHeightPx") or font_size * 1.4), 1),
                     }
 
-        # Collect top-level sections
-        if node_type in {"FRAME", "COMPONENT", "SECTION"} and (
-            parent_type in {"CANVAS", "SECTION", ""} or depth in {1, 2}
+        # Extract Menu items from navigation/menu containers
+        if node_type in {"FRAME", "GROUP", "COMPONENT"} and any(
+            k in norm_name for k in ("menu", "nav", "navigation")
         ):
-            if len(sections) < 20:
-                sections.append(
+            if width is None or float(width) >= 240:
+                m_texts: list[dict[str, Any]] = []
+                _collect_texts(node, m_texts, max_items=20)
+                m_texts.sort(key=lambda t: t["x"])
+                for t in m_texts:
+                    label = t["text"]
+                    if (
+                        2 <= len(label) <= 32
+                        and "@" not in label
+                        and not re.fullmatch(r"[\d\s.+()-]+", label)
+                        and label not in menu_items
+                    ):
+                        menu_items.append(label)
+
+        # Collect ONLY major homepage sections (skip root page canvas and tiny UI atoms)
+        w_val = float(width) if width is not None else 1440.0
+        h_val = float(height) if height is not None else 600.0
+        is_whole_page_canvas = w_val >= 1000 and h_val >= 2000
+        is_major_band = w_val >= 650 and 70 <= h_val < 2000
+
+        if (
+            node_type in {"FRAME", "COMPONENT", "SECTION", "GROUP"}
+            and not is_whole_page_canvas
+            and is_major_band
+            and (parent_type in {"CANVAS", "SECTION", "FRAME", ""} and depth in {1, 2, 3})
+        ):
+            sec_title = node_name
+            if is_junk_section_name(sec_title):
+                sec_title = _extract_heading_text(node)
+            if sec_title and not is_junk_section_name(sec_title):
+                raw_sections.append(
                     {
                         "id": str(node.get("id", "")),
-                        "name": node_name or f"Section {len(sections) + 1}",
-                        "width": round(float(width or 1440)),
-                        "height": round(float(height or 600)),
+                        "name": sec_title,
+                        "width": round(w_val),
+                        "height": round(h_val),
+                        "y": round(y_pos),
                         "layoutMode": node.get("layoutMode", "NONE"),
                     }
                 )
@@ -154,6 +265,26 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
 
     for root in collect_roots(figma_json):
         walk(root, 0, "")
+
+    raw_sections.sort(key=lambda s: (s.get("y", 0), -s.get("width", 0)))
+    sections: list[dict[str, Any]] = []
+    seen_sec_names: set[str] = set()
+    for sec in raw_sections:
+        key = sec["name"].strip().lower()
+        if key in seen_sec_names:
+            continue
+        seen_sec_names.add(key)
+        sections.append(
+            {
+                "id": sec["id"],
+                "name": sec["name"],
+                "width": sec["width"],
+                "height": sec["height"],
+                "layoutMode": sec["layoutMode"],
+            }
+        )
+        if len(sections) >= 16:
+            break
 
     sorted_colors = [
         {"hex": hex_code, "count": count}
@@ -177,6 +308,7 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
         "colors": sorted_colors,
         "fonts": fonts_unique or ["Be Vietnam Pro"],
         "typography_scale": list(typography.values())[:16],
+        "menu_items": menu_items[:12],
         "sections": sections,
         "export_nodes": dedup_exports[:16],
         "stats": {
@@ -224,6 +356,7 @@ def build_offline_demo_tokens(figma_url: str, spec_text: str) -> dict[str, Any]:
             {"fontFamily": "Be Vietnam Pro", "fontSize": 18.0, "fontWeight": 600, "lineHeightPx": 26.0},
             {"fontFamily": "Be Vietnam Pro", "fontSize": 15.0, "fontWeight": 400, "lineHeightPx": 24.0},
         ],
+        "menu_items": ["Trang chủ", "Giới thiệu", "Sản phẩm", "Dịch vụ", "Tin tức", "Liên hệ"],
         "sections": [
             {"id": "10:101", "name": "Header Navigation", "width": 1440, "height": 80, "layoutMode": "HORIZONTAL"},
             {"id": "10:201", "name": "Hero Banner", "width": 1440, "height": 620, "layoutMode": "HORIZONTAL"},

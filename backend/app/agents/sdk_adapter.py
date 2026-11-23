@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from ..config import get_runtime_env
 
 try:
     import google.antigravity as ga  # type: ignore
@@ -17,9 +20,13 @@ except Exception as exc:  # pragma: no cover - environment dependent
 
 
 def check_sdk_status() -> dict[str, Any]:
-    if SDK_AVAILABLE:
-        return {"available": True, "detail": "google-antigravity SDK ready"}
-    return {"available": False, "detail": SDK_IMPORT_ERROR or "google-antigravity not installed"}
+    if not SDK_AVAILABLE:
+        return {"available": False, "detail": SDK_IMPORT_ERROR or "google-antigravity not installed"}
+    api_key = get_runtime_env("GEMINI_API_KEY")
+    if not api_key:
+        return {"available": False, "detail": "Thiếu GEMINI_API_KEY trong backend/.env"}
+    os.environ["GEMINI_API_KEY"] = api_key
+    return {"available": True, "detail": "google-antigravity SDK ready"}
 
 
 class AntigravityAgentRunner:
@@ -37,6 +44,10 @@ class AntigravityAgentRunner:
     ) -> str:
         if not SDK_AVAILABLE or ga is None:
             raise RuntimeError(f"Antigravity SDK unavailable: {SDK_IMPORT_ERROR}")
+
+        api_key = get_runtime_env("GEMINI_API_KEY")
+        if api_key:
+            os.environ["GEMINI_API_KEY"] = api_key
 
         workspaces = [working_dir] if working_dir and Path(working_dir).exists() else None
         skills_paths = [skills_dir] if skills_dir and Path(skills_dir).exists() else None
