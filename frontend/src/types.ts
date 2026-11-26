@@ -166,6 +166,7 @@ export interface ProjectState {
   spec_sections?: SpecSectionItem[];
   spec_metadata?: Record<string, string>;
   spec_global_features?: string[];
+  missing_fonts?: string[];
   plan_approved: boolean;
   plan_review_note: string;
   token_stats: TokenStats;

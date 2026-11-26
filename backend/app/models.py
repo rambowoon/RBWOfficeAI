@@ -188,6 +188,7 @@ class ProjectState(BaseModel):
     spec_sections: list[SpecSectionItem] = Field(default_factory=list)
     spec_metadata: dict[str, str] = Field(default_factory=dict)
     spec_global_features: list[str] = Field(default_factory=list)
+    missing_fonts: list[str] = Field(default_factory=list)
     plan_approved: bool = False
     plan_review_note: str = ""
     token_stats: TokenStats = Field(default_factory=TokenStats)
@@ -206,7 +207,7 @@ class ProjectState(BaseModel):
 
 def build_default_agents() -> dict[str, AgentState]:
     specs: list[tuple[str, str, AgentRole, str]] = [
-        ("leader", "Minh (Leader)", "leader", "Tech Lead & Architect"),
+        ("leader", "Thiện (Leader)", "leader", "Tech Lead & Architect"),
         ("asset", "Linh (Assets & Config)", "asset", "Config, Font/WebP & Seed"),
         ("dev", "Vy (UI & Frontend)", "dev", "HTML/Blade, CSS & Responsive"),
         ("qa", "Tuấn (QA & Tester)", "qa", "Static & Playwright QA"),

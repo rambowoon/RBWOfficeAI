@@ -354,10 +354,10 @@ export function NewProjectModal() {
               }}
             >
               <div style={{ fontWeight: 700, fontSize: 12 }}>
-                Live Antigravity SDK {health?.sdk.available ? "(Sẵn sàng)" : "(Chưa auth)"}
+                Live Antigravity CLI {health?.sdk.available ? "(Sẵn sàng)" : "(Chưa sẵn sàng)"}
               </div>
               <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 3 }}>
-                Gọi thật google-antigravity SDK nạp rules từ .agents/ + Offline QA.
+                Chạy qua Antigravity CLI (`agy`) đọc/sửa code thật trên source + Offline QA.
               </div>
             </button>
           </div>

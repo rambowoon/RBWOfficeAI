@@ -128,8 +128,14 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
     colors: dict[str, int] = {}
     typography: dict[tuple[str, float, int], dict[str, Any]] = {}
     raw_sections: list[dict[str, Any]] = []
+    font_counts: dict[str, int] = {}
+    container_widths: dict[int, int] = {}
+    all_texts: list[str] = []
     menu_items: list[str] = []
-    export_nodes: list[dict[str, str]] = []
+    export_nodes: list[dict[str, Any]] = []
+    image_dimensions: dict[str, dict[str, int]] = {}
+    section_export_counts: dict[str, int] = {}
+    seen_bg_sections: set[str] = set()
     stats = {"raw_node_count": 0, "kept_node_count": 0}
 
     def collect_roots(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -143,7 +149,80 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
             return roots
         return [payload]
 
-    def walk(node: dict[str, Any], depth: int, parent_type: str = "") -> None:
+    def _canonical_section_slug(raw_sec_name: str) -> str:
+        low = _slugify(re.sub(r"[_#]+", " ", raw_sec_name))
+        if re.search(r"\b(qc|quangcao|quang-cao|banner)\b", low):
+            return "quang-cao"
+        if "slide" in low or low in {"hing", "hero"}:
+            return "slideshow"
+        if any(k in low for k in ("tieuchi", "tieu-chi", "taisao", "tai-sao", "visao", "vi-sao")):
+            return "vi-sao" if "visao" in low or "vi-sao" in low else "tieu-chi"
+        if any(k in low for k in ("thanhtuu", "thanh-tuu", "thongke", "thong-ke")):
+            return "thanh-tuu"
+        if any(k in low for k in ("noibat", "sanpham", "san-pham", "nhom-sp")):
+            return "san-pham"
+        if any(k in low for k in ("gioithieu", "gioi-thieu")):
+            return "gioi-thieu"
+        if any(k in low for k in ("ykien", "y-kien", "camnhan", "cam-nhan")):
+            return "cam-nhan-khach-hang"
+        if "tintuc" in low or "tin-tuc" in low:
+            return "tin-tuc"
+        if "footer" in low:
+            return "footer"
+        if "album" in low:
+            return "album"
+        return low
+
+    def _is_vector_icon_container(n: dict[str, Any], nw: float | None, nh: float | None) -> bool:
+        if nw is None or nh is None or not (18 <= nw <= 160 and 18 <= nh <= 160):
+            return False
+        kids = [k for k in (n.get("children") or []) if isinstance(k, dict) and k.get("visible") is not False]
+        if not kids:
+            return False
+        # Exclude interactive buttons / text labels; icon containers hold vector/shape primitives only
+        def _only_shapes(sub: dict[str, Any]) -> bool:
+            st = str(sub.get("type", ""))
+            if st == "TEXT":
+                return False
+            if st in {"VECTOR", "BOOLEAN_OPERATION", "ELLIPSE", "STAR", "REGULAR_POLYGON", "LINE"}:
+                return True
+            if st in {"GROUP", "FRAME", "RECTANGLE"}:
+                if any(isinstance(p, dict) and p.get("type") == "IMAGE" and p.get("visible") is not False for p in (sub.get("fills") or [])):
+                    return False
+                sub_kids = [c for c in (sub.get("children") or []) if isinstance(c, dict) and c.get("visible") is not False]
+                if st == "RECTANGLE" and not sub_kids:
+                    return False
+                return all(_only_shapes(c) for c in sub_kids) if sub_kids else False
+            return False
+        return all(_only_shapes(k) for k in kids)
+
+    def _extract_sub_categories(sec_node: dict[str, Any]) -> list[str]:
+        subs: list[str] = []
+        for c in sec_node.get("children") or []:
+            if not isinstance(c, dict) or c.get("visible") is False:
+                continue
+            cbb = c.get("absoluteBoundingBox") or {}
+            cw = float(cbb.get("width") or 0)
+            ch = float(cbb.get("height") or 0)
+            if cw >= 650 and ch >= 200 and not any(k in str(c.get("name", "")).lower() for k in ("tile", "title")):
+                ts: list[dict[str, Any]] = []
+                _collect_texts(c, ts, max_items=10)
+                ts.sort(key=lambda t: (t["y"], t["x"]))
+                for t in ts:
+                    lbl = t["text"].strip()
+                    if 2 <= len(lbl) <= 40 and lbl.lower() not in {"xem tất cả", "xem chi tiết", "liên hệ ngay"}:
+                        subs.append(lbl)
+                        break
+        return subs
+
+    def walk(
+        node: dict[str, Any],
+        depth: int,
+        parent_type: str = "",
+        current_section: str = "",
+        parent_is_page_root: bool = False,
+        inside_banner_composite: bool = False,
+    ) -> None:
         if not isinstance(node, dict):
             return
         stats["raw_node_count"] += 1
@@ -153,6 +232,7 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
         bbox = node.get("absoluteBoundingBox") or {}
         width = bbox.get("width")
         height = bbox.get("height")
+        x_pos = float(bbox.get("x") or 0)
         y_pos = float(bbox.get("y") or 0)
         node_type = str(node.get("type", ""))
         node_name = str(node.get("name", "")).strip()
@@ -171,7 +251,25 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
 
         stats["kept_node_count"] += 1
 
-        # Extract solid fills & strokes
+        w_val = float(width) if width is not None else 1440.0
+        h_val = float(height) if height is not None else 600.0
+        is_whole_page_canvas = (
+            node_type in {"FRAME", "COMPONENT", "SECTION", "GROUP"}
+            and w_val >= 1000
+            and h_val >= 1500
+            and (depth == 0 or parent_type == "CANVAS")
+        )
+        if (
+            not is_whole_page_canvas
+            and node_type in {"FRAME", "GROUP", "COMPONENT"}
+            and 1080 <= round(w_val) <= 1440
+            and round(w_val) not in {1440}
+            and current_section
+        ):
+            rw = round(w_val)
+            container_widths[rw] = container_widths.get(rw, 0) + 1
+
+        # Solid fills / strokes for colors + IMAGE fills for item photos / backgrounds
         for paint_list_key in ("fills", "strokes"):
             for paint in node.get(paint_list_key) or []:
                 if not isinstance(paint, dict) or paint.get("visible") is False:
@@ -181,21 +279,73 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
                     if hex_code:
                         colors[hex_code] = colors.get(hex_code, 0) + 1
                 elif paint.get("type") == "IMAGE" and node.get("id"):
-                    export_nodes.append(
-                        {
-                            "node_id": str(node["id"]),
-                            "name": _slugify(node_name or f"img-{node['id']}"),
-                            "kind": "image",
-                        }
+                    slug = _slugify(node_name or f"img-{node['id']}")
+                    w_px = round(float(width or 0))
+                    h_px = round(float(height or 0))
+                    min_dim = min(w_px, h_px) if w_px > 0 and h_px > 0 else 0
+                    max_dim = max(w_px, h_px)
+                    is_whole_page_img = h_px >= 2000
+                    is_extreme_strip = min_dim < 40 or (min_dim > 0 and (max_dim / min_dim) > 7.0)
+                    is_named_photo = any(k in norm_name for k in ("logo", "favicon", "slide", "banner"))
+                    sec_key = current_section or slug
+                    is_bg_node = (
+                        norm_name.startswith(("::before", "::after", "bg", "background"))
+                        or (
+                            w_px >= 1400
+                            and not is_named_photo
+                            and sec_key not in {"slide", "slideshow", "quang-cao", "quang-cao-2"}
+                        )
                     )
+                    if is_whole_page_img:
+                        continue
+                    if not inside_banner_composite:
+                        if is_bg_node:
+                            if sec_key not in seen_bg_sections:
+                                seen_bg_sections.add(sec_key)
+                                export_nodes.append(
+                                    {
+                                        "node_id": str(node["id"]),
+                                        "name": slug,
+                                        "kind": "image",
+                                        "role": "section_bg",
+                                        "section": sec_key,
+                                        "image_ref": str(paint.get("imageRef") or ""),
+                                        "width": w_px,
+                                        "height": h_px,
+                                    }
+                                )
+                        elif is_named_photo or not is_extreme_strip:
+                            if is_named_photo or section_export_counts.get(sec_key, 0) < 6:
+                                section_export_counts[sec_key] = section_export_counts.get(sec_key, 0) + 1
+                                export_nodes.append(
+                                    {
+                                        "node_id": str(node["id"]),
+                                        "name": slug,
+                                        "kind": "image",
+                                        "role": "item_photo",
+                                        "section": sec_key,
+                                        "image_ref": str(paint.get("imageRef") or ""),
+                                        "width": w_px,
+                                        "height": h_px,
+                                    }
+                                )
+                    if not is_bg_node and w_px > 0 and h_px > 0:
+                        if slug not in image_dimensions:
+                            image_dimensions[slug] = {"width": w_px, "height": h_px}
+                        if sec_key and sec_key not in image_dimensions and "logo" not in slug and min_dim >= 45:
+                            image_dimensions[sec_key] = {"width": w_px, "height": h_px}
 
         # Extract typography from TEXT nodes
         if node_type == "TEXT":
+            chars = " ".join(str(node.get("characters") or "").split()).strip()
+            if chars and len(all_texts) < 150:
+                all_texts.append(chars)
             style = node.get("style") or {}
             font_family = str(style.get("fontFamily") or "").strip()
             font_size = float(style.get("fontSize") or 16)
             font_weight = int(style.get("fontWeight") or 400)
             if font_family:
+                font_counts[font_family] = font_counts.get(font_family, 0) + 1
                 key = (font_family, round(font_size, 1), font_weight)
                 if key not in typography:
                     typography[key] = {
@@ -223,75 +373,279 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
                     ):
                         menu_items.append(label)
 
-        # Collect ONLY major homepage sections (skip root page canvas and tiny UI atoms)
-        w_val = float(width) if width is not None else 1440.0
-        h_val = float(height) if height is not None else 600.0
-        is_whole_page_canvas = w_val >= 1000 and h_val >= 2000
-        is_major_band = w_val >= 650 and 70 <= h_val < 2000
+        # Collect major homepage sections strictly from direct children of Page Root (or CANVAS if no whole-page wrapper)
+        canvas_has_page_wrapper = node_type == "CANVAS" and any(
+            isinstance(c, dict)
+            and c.get("visible") is not False
+            and float((c.get("absoluteBoundingBox") or {}).get("height") or 0) >= 1500
+            for c in (node.get("children") or [])
+        )
+        children_are_page_sections = is_whole_page_canvas or (node_type == "CANVAS" and not canvas_has_page_wrapper)
 
-        if (
-            node_type in {"FRAME", "COMPONENT", "SECTION", "GROUP"}
+        next_section = current_section
+        next_inside_composite = inside_banner_composite
+        hero_child = None
+        is_section_candidate = (
+            parent_is_page_root
+            and node_type in {"FRAME", "COMPONENT", "SECTION", "GROUP"}
             and not is_whole_page_canvas
-            and is_major_band
-            and (parent_type in {"CANVAS", "SECTION", "FRAME", ""} and depth in {1, 2, 3})
-        ):
+            and w_val >= 500
+            and h_val >= 70
+        )
+
+        if is_section_candidate:
             sec_title = node_name
             if is_junk_section_name(sec_title):
                 sec_title = _extract_heading_text(node)
             if sec_title and not is_junk_section_name(sec_title):
-                raw_sections.append(
+                next_section = _canonical_section_slug(sec_title)
+                sec_texts: list[dict[str, Any]] = []
+                _collect_texts(node, sec_texts, max_items=80)
+                unique_sec_texts = list(dict.fromkeys(t["text"] for t in sec_texts if t.get("text")))[:50]
+
+                # Combined Header + Hero Slide group (e.g. leviet `header` 1920x900 containing `hing` 1920x700)
+                hero_child = None
+                if next_section == "header" and h_val >= 550:
+                    for ch in node.get("children") or []:
+                        if not isinstance(ch, dict) or ch.get("visible") is False:
+                            continue
+                        ch_bb = ch.get("absoluteBoundingBox") or {}
+                        ch_w, ch_h = float(ch_bb.get("width") or 0), float(ch_bb.get("height") or 0)
+                        ch_low = str(ch.get("name") or "").lower()
+                        if ch_w >= 1200 and ch_h >= 400 and ("menu" not in ch_low and "nav" not in ch_low):
+                            hero_child = ch
+                            break
+
+                if hero_child is not None:
+                    hbb = hero_child.get("absoluteBoundingBox") or {}
+                    hw, hh = round(float(hbb.get("width") or 1920)), round(float(hbb.get("height") or 700))
+                    raw_sections.append(
+                        {
+                            "id": str(node.get("id", "")),
+                            "name": "Header",
+                            "width": round(w_val),
+                            "height": max(70, round(h_val - hh)),
+                            "x": round(x_pos),
+                            "y": round(y_pos),
+                            "layoutMode": node.get("layoutMode", "NONE"),
+                            "texts": unique_sec_texts,
+                        }
+                    )
+                    raw_sections.append(
+                        {
+                            "id": str(hero_child.get("id", "")),
+                            "name": "Slide",
+                            "width": hw,
+                            "height": hh,
+                            "x": round(float(hbb.get("x") or 0)),
+                            "y": round(float(hbb.get("y") or y_pos)) + 1,
+                            "layoutMode": hero_child.get("layoutMode", "NONE"),
+                            "texts": [],
+                        }
+                    )
+                else:
+                    sub_cats = _extract_sub_categories(node) if next_section == "san-pham" and h_val >= 900 else []
+                    raw_sections.append(
+                        {
+                            "id": str(node.get("id", "")),
+                            "name": sec_title,
+                            "width": round(w_val),
+                            "height": round(h_val),
+                            "x": round(x_pos),
+                            "y": round(y_pos),
+                            "layoutMode": node.get("layoutMode", "NONE"),
+                            "texts": unique_sec_texts,
+                            "sub_categories": sub_cats,
+                        }
+                    )
+
+                if any(k in norm_name for k in ("slide", "qc", "quangcao", "quang cao", "quảng cáo")):
+                    next_inside_composite = True
+
+        # Vector icon groups inside sections (e.g. vi_sao 54x49, product category icon 45x40, customer/social icons)
+        elif (
+            node.get("id")
+            and not inside_banner_composite
+            and current_section
+            and node_type in {"FRAME", "GROUP", "INSTANCE", "COMPONENT"}
+            and _is_vector_icon_container(node, width, height)
+        ):
+            w_px, h_px = round(w_val), round(h_val)
+            icon_key = f"icon:{current_section}"
+            if section_export_counts.get(icon_key, 0) < 6:
+                section_export_counts[icon_key] = section_export_counts.get(icon_key, 0) + 1
+                export_nodes.append(
                     {
-                        "id": str(node.get("id", "")),
-                        "name": sec_title,
-                        "width": round(w_val),
-                        "height": round(h_val),
-                        "y": round(y_pos),
-                        "layoutMode": node.get("layoutMode", "NONE"),
+                        "node_id": str(node["id"]),
+                        "name": _slugify(node_name or f"icon-{node['id']}"),
+                        "kind": "vector",
+                        "role": "item_icon",
+                        "section": current_section,
+                        "width": w_px,
+                        "height": h_px,
                     }
                 )
+            if current_section not in image_dimensions:
+                image_dimensions[current_section] = {"width": w_px, "height": h_px}
 
         # Explicit exportSettings on icons/vectors
-        if node.get("exportSettings") and node.get("id"):
-            export_nodes.append(
-                {
-                    "node_id": str(node["id"]),
-                    "name": _slugify(node_name or f"asset-{node['id']}"),
-                    "kind": "vector" if node_type in {"VECTOR", "BOOLEAN_OPERATION"} else "image",
-                }
-            )
+        if node.get("exportSettings") and node.get("id") and not is_whole_page_canvas:
+            slug = _slugify(node_name or f"asset-{node['id']}")
+            w_px = round(float(width or 0))
+            h_px = round(float(height or 0))
+            if h_px < 2000:
+                export_nodes.append(
+                    {
+                        "node_id": str(node["id"]),
+                        "name": slug,
+                        "kind": "vector" if node_type in {"VECTOR", "BOOLEAN_OPERATION"} else "image",
+                        "role": "item_icon" if w_px <= 160 else "item_photo",
+                        "section": next_section or slug,
+                        "width": w_px,
+                        "height": h_px,
+                    }
+                )
+            if w_px > 0 and h_px > 0 and slug not in image_dimensions:
+                image_dimensions[slug] = {"width": w_px, "height": h_px}
 
         for child in node.get("children") or []:
-            walk(child, depth + 1, node_type)
+            child_sec = next_section
+            if hero_child is not None and child is hero_child:
+                child_sec = "slideshow"
+            walk(
+                child,
+                depth + 1,
+                node_type,
+                child_sec,
+                children_are_page_sections,
+                next_inside_composite or (hero_child is not None and child is hero_child),
+            )
 
     for root in collect_roots(figma_json):
-        walk(root, 0, "")
+        walk(root, 0, "", "", False, False)
 
-    raw_sections.sort(key=lambda s: (s.get("y", 0), -s.get("width", 0)))
+    def _is_ad_sec(name_val: str) -> bool:
+        low_s = re.sub(r"\s+", " ", (name_val or "").strip().lower())
+        return bool(re.search(r"\b(?:qc|quangcao|quang cao|quảng cáo|banner)\b", low_s))
+
+    raw_sections.sort(key=lambda s: (s.get("y", 0), s.get("x", 0), -s.get("width", 0)))
+
+    # Merge side-by-side ad banners on the same horizontal row (e.g. QC 1 + QC 2 at same y)
+    grouped_raw: list[dict[str, Any]] = []
+    ad_group_counter = 0
+    for sec in raw_sections:
+        if _is_ad_sec(sec["name"]):
+            if (
+                grouped_raw
+                and grouped_raw[-1].get("_is_ad")
+                and abs(sec.get("y", 0) - grouped_raw[-1].get("y", 0)) <= 24
+            ):
+                prev = grouped_raw[-1]
+                prev["child_ids"].append(sec["id"])
+                prev["item_count"] += 1
+                for txt in sec.get("texts") or []:
+                    if txt not in prev["texts"]:
+                        prev["texts"].append(txt)
+                continue
+            ad_group_counter += 1
+            canonical_ad_name = "Quảng cáo" if ad_group_counter == 1 else f"Quảng cáo {ad_group_counter}"
+            grouped_raw.append(
+                {
+                    **sec,
+                    "name": canonical_ad_name,
+                    "_is_ad": True,
+                    "child_ids": [sec["id"]] if sec.get("id") else [],
+                    "item_count": 1,
+                }
+            )
+        else:
+            grouped_raw.append({**sec, "_is_ad": False, "child_ids": [sec["id"]] if sec.get("id") else [], "item_count": 1})
+
     sections: list[dict[str, Any]] = []
     seen_sec_names: set[str] = set()
-    for sec in raw_sections:
+    for sec in grouped_raw:
         key = sec["name"].strip().lower()
         if key in seen_sec_names:
             continue
         seen_sec_names.add(key)
-        sections.append(
-            {
-                "id": sec["id"],
-                "name": sec["name"],
-                "width": sec["width"],
-                "height": sec["height"],
-                "layoutMode": sec["layoutMode"],
-            }
-        )
+        sec_entry: dict[str, Any] = {
+            "id": sec["id"],
+            "name": sec["name"],
+            "width": sec["width"],
+            "height": sec["height"],
+            "layoutMode": sec["layoutMode"],
+            "texts": sec.get("texts", []),
+            "item_count": sec.get("item_count", 1),
+        }
+        if sec.get("sub_categories"):
+            sec_entry["sub_categories"] = sec["sub_categories"]
+        if len(sec.get("child_ids") or []) > 1:
+            sec_entry["child_node_ids"] = sec["child_ids"]
+        sections.append(sec_entry)
+
+        # Ensure composite WebP exports for Slide & Ad Banners (text baked into graphic)
+        if sec.get("_is_ad") or "slide" in key:
+            export_sec = "slideshow" if "slide" in key else _slugify(sec["name"])
+            for idx_c, cid in enumerate(sec.get("child_ids") or [], start=1):
+                if cid:
+                    export_nodes.append(
+                        {
+                            "node_id": str(cid),
+                            "name": f"{export_sec}-{idx_c}",
+                            "kind": "image",
+                            "role": "banner",
+                            "section": export_sec,
+                            "width": int(sec["width"]),
+                            "height": int(sec["height"]),
+                        }
+                    )
         if len(sections) >= 16:
             break
+
+    # Extract real contact info from Figma header/footer/all texts (joining split 2-line company names)
+    combined_candidates: list[str] = []
+    for s in sections:
+        if any(k in s["name"].lower() for k in ("header", "footer", "lienhe", "liên hệ")):
+            combined_candidates.extend(s.get("texts") or [])
+    combined_candidates.extend(all_texts)
+
+    contact_info: dict[str, str] = {}
+    for idx_t, t in enumerate(combined_candidates):
+        t_str = str(t or "").strip()
+        if not t_str:
+            continue
+        if "email" not in contact_info:
+            m_mail = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", t_str)
+            if m_mail:
+                contact_info["email"] = m_mail.group(0)
+        if "hotline" not in contact_info:
+            m_tel = re.search(r"(?:0|\+84)[\d\s.]{7,13}\d", t_str)
+            if m_tel:
+                contact_info["hotline"] = m_tel.group(0).strip()
+        if "company_name" not in contact_info and any(
+            k in t_str.upper() for k in ("CÔNG TY", "CTY ", "CƠ KHÍ", "DOANH NGHIỆP")
+        ) and len(t_str) <= 120:
+            full_name = t_str
+            if idx_t + 1 < len(combined_candidates):
+                nxt = str(combined_candidates[idx_t + 1] or "").strip()
+                if nxt and nxt.isupper() and 3 <= len(nxt) <= 60 and "ĐỊA CHỈ" not in nxt and "HOTLINE" not in nxt:
+                    full_name = f"{t_str} {nxt}".strip()
+            contact_info["company_name"] = full_name
+        if "address" not in contact_info and any(
+            k in t_str.lower() for k in ("phường", "quận", "tỉnh", "tp.", "tp ", "thửa đất", "ấp ", "đường ", "địa chỉ", "lô ", "kcn")
+        ) and len(t_str) >= 15:
+            contact_info["address"] = re.sub(r"^(?:địa\s*chỉ\s*[:：]\s*)", "", t_str, flags=re.IGNORECASE).strip()
 
     sorted_colors = [
         {"hex": hex_code, "count": count}
         for hex_code, count in sorted(colors.items(), key=lambda x: -x[1])[:16]
     ]
-    fonts_unique = sorted({t["fontFamily"] for t in typography.values()})
-    dedup_exports: list[dict[str, str]] = []
+    fonts_unique = (
+        [f for f, _ in sorted(font_counts.items(), key=lambda x: (-x[1], x[0]))]
+        if font_counts
+        else sorted({t["fontFamily"] for t in typography.values()})
+    )
+    dedup_exports: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for item in export_nodes:
         if item["node_id"] not in seen_ids:
@@ -302,15 +656,23 @@ def extract_compact_tokens(figma_json: dict[str, Any]) -> dict[str, Any]:
     kept_cnt = stats["kept_node_count"]
     saved_pct = max(0, min(95, round((1 - kept_cnt / raw_cnt) * 100)))
 
+    detected_container_w = (
+        max(container_widths.items(), key=lambda x: (x[1], x[0]))[0]
+        if container_widths
+        else 1200
+    )
     return {
         "source": "figma_api",
         "file_name": figma_json.get("name", "Figma Design"),
         "colors": sorted_colors,
         "fonts": fonts_unique or ["Be Vietnam Pro"],
+        "container_width": detected_container_w,
         "typography_scale": list(typography.values())[:16],
         "menu_items": menu_items[:12],
         "sections": sections,
-        "export_nodes": dedup_exports[:16],
+        "export_nodes": dedup_exports[:60],
+        "image_dimensions": image_dimensions,
+        "contact_info": contact_info,
         "stats": {
             "raw_node_count": stats["raw_node_count"],
             "kept_node_count": stats["kept_node_count"],
@@ -365,12 +727,17 @@ def build_offline_demo_tokens(figma_url: str, spec_text: str) -> dict[str, Any]:
             {"id": "10:501", "name": "Lien He & Footer", "width": 1440, "height": 420, "layoutMode": "VERTICAL"},
         ],
         "export_nodes": [
-            {"node_id": "20:1", "name": "hero-banner", "kind": "image"},
-            {"node_id": "20:2", "name": "product-1", "kind": "image"},
-            {"node_id": "20:3", "name": "product-2", "kind": "image"},
-            {"node_id": "20:4", "name": "product-3", "kind": "image"},
-            {"node_id": "20:5", "name": "about-showcase", "kind": "image"},
+            {"node_id": "20:1", "name": "hero-banner", "kind": "image", "width": 1920, "height": 650},
+            {"node_id": "20:2", "name": "product-1", "kind": "image", "width": 600, "height": 600},
+            {"node_id": "20:3", "name": "product-2", "kind": "image", "width": 600, "height": 600},
+            {"node_id": "20:4", "name": "product-3", "kind": "image", "width": 600, "height": 600},
+            {"node_id": "20:5", "name": "about-showcase", "kind": "image", "width": 600, "height": 400},
         ],
+        "image_dimensions": {
+            "hero-banner": {"width": 1920, "height": 650},
+            "product-1": {"width": 600, "height": 600},
+            "about-showcase": {"width": 600, "height": 400},
+        },
         "stats": {
             "raw_node_count": 480,
             "kept_node_count": 112,

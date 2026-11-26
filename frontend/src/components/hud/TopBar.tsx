@@ -6,6 +6,7 @@ import {
   Plus,
   RotateCcw,
   Sparkles,
+  Trash2,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -33,6 +34,9 @@ export function TopBar() {
   const setShowPlanReview = useOfficeStore((s) => s.setShowPlanReview);
   const setShowBugBoard = useOfficeStore((s) => s.setShowBugBoard);
   const setShowPreviewDrawer = useOfficeStore((s) => s.setShowPreviewDrawer);
+  const retryProject = useOfficeStore((s) => s.retryProject);
+  const deleteProject = useOfficeStore((s) => s.deleteProject);
+  const isSubmitting = useOfficeStore((s) => s.isSubmitting);
   const setFocusTarget = useOfficeStore((s) => s.setFocusTarget);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
@@ -279,7 +283,75 @@ export function TopBar() {
               <Eye size={14} />
               <span>Preview & Tokens</span>
             </button>
+
+            <button
+              type="button"
+              disabled={isSubmitting}
+              title="Reset và chạy lại dự án này từ đầu"
+              onClick={() => void retryProject(activeProject.id)}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                background:
+                  activeProject.phase === "failed"
+                    ? "rgba(245,158,11,0.22)"
+                    : "rgba(30,41,59,0.9)",
+                color: activeProject.phase === "failed" ? "#fbbf24" : "#cbd5e1",
+                border:
+                  activeProject.phase === "failed"
+                    ? "1px solid rgba(245,158,11,0.5)"
+                    : "1px solid rgba(148,163,184,0.3)",
+                borderRadius: 8,
+                padding: "6px 10px",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: isSubmitting ? "wait" : "pointer",
+              }}
+            >
+              <RotateCcw size={13} />
+              <span>Chạy lại</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={isSubmitting}
+              title="Xóa bản chạy dự án này khỏi danh sách"
+              onClick={() => void deleteProject(activeProject.id)}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                background: "rgba(239,68,68,0.14)",
+                color: "#fca5a5",
+                border: "1px solid rgba(239,68,68,0.35)",
+                borderRadius: 8,
+                padding: "6px 9px",
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: isSubmitting ? "wait" : "pointer",
+              }}
+            >
+              <Trash2 size={13} />
+            </button>
           </>
+        )}
+
+        {activeProject && (activeProject.missing_fonts?.length ?? 0) > 0 && (
+          <span
+            title={`Thiếu font: ${activeProject.missing_fonts?.join(", ")}. Hãy thêm vào thư mục Font hoặc assets/fonts/`}
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              padding: "4px 9px",
+              borderRadius: 8,
+              background: "rgba(245,158,11,0.2)",
+              color: "#fbbf24",
+              border: "1px solid rgba(245,158,11,0.5)",
+            }}
+          >
+            ⚠️ Thiếu font: {activeProject.missing_fonts?.join(", ")}
+          </span>
         )}
 
         <button

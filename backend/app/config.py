@@ -52,6 +52,7 @@ class Settings:
     DEFAULT_SOURCE_DIR: str = os.getenv("DEFAULT_SOURCE_DIR", "")
     DEFAULT_PREVIEW_URL: str = os.getenv("DEFAULT_PREVIEW_URL", "")
     PHP_BIN: str = os.getenv("PHP_BIN", "")
+    FONT_SOURCE_DIR: str = os.getenv("FONT_SOURCE_DIR", r"E:\Font")
 
 
 settings = Settings()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -25,8 +27,11 @@ from ..models import (
     build_default_agents,
     utc_now_iso,
 )
-from ..offline.asset_pipeline import run_asset_and_font_pipeline
+from ..offline.asset_pipeline import convert_workspace_images_to_webp, run_asset_and_font_pipeline
 from ..offline.figma_parser import fetch_figma_tokens, parse_figma_url
+from ..offline.font_manager import upsert_root_fonts_in_style_css
+from ..offline.nasanic_configurator import configure_nasanic_types, wire_nasanic_controllers
+from ..offline.nasanic_seeder import build_figma_and_ai_seed_data, seed_nasanic_database
 from ..offline.qa_runner import run_playwright_checks, run_static_checks
 from ..offline.source_scaffold import (
     apply_demo_bug_fixes,
@@ -58,6 +63,14 @@ class OfficeOrchestrator:
         self._ephemeral_assets: dict[str, dict[str, Any]] = {}
         self._ephemeral_tokens_data: dict[str, dict[str, Any]] = {}
         self._ephemeral_workspace: dict[str, dict[str, Any]] = {}
+
+    def _resolve_figma_token(self, project_id: str) -> str:
+        return (
+            self._ephemeral_figma_tokens.get(project_id)
+            or get_runtime_env("FIGMA_ACCESS_TOKEN")
+            or settings.FIGMA_ACCESS_TOKEN
+            or ""
+        ).strip()
 
     async def create_and_start(self, req: ProjectCreate) -> ProjectState:
         project_id = uuid.uuid4().hex[:10]
@@ -102,6 +115,55 @@ class OfficeOrchestrator:
         task = asyncio.create_task(self._run_leader_analysis(project_id))
         self._tasks[project_id] = task
         return state
+
+    async def retry_project(self, project_id: str) -> ProjectState:
+        """Reset a failed/completed project's run state and re-run from Leader analysis."""
+        state = self.bus.get_project(project_id)
+        if not state:
+            raise KeyError("Project not found")
+
+        old_task = self._tasks.get(project_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        workspace_ctx = inspect_workspace_context(state.target_source_dir)
+        self._ephemeral_workspace[project_id] = workspace_ctx
+        if not self._ephemeral_figma_tokens.get(project_id):
+            env_token = get_runtime_env("FIGMA_ACCESS_TOKEN")
+            if env_token:
+                self._ephemeral_figma_tokens[project_id] = env_token
+
+        state.framework = workspace_ctx["framework"]
+        state.phase = "planning"
+        state.qa_round = 0
+        state.plan_approved = False
+        state.plan_review_note = ""
+        state.error_message = None
+        state.missing_fonts = []
+        state.bugs = []
+        state.tasks = []
+        state.screenshots = {}
+        state.timeline = []
+        state.agents = build_default_agents()
+
+        self.bus.save_project(state)
+        await self.bus.emit_project_sync(state, "project_retried")
+
+        task = asyncio.create_task(self._run_leader_analysis(project_id))
+        self._tasks[project_id] = task
+        return state
+
+    async def delete_project(self, project_id: str) -> None:
+        old_task = self._tasks.pop(project_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._ephemeral_figma_tokens.pop(project_id, None)
+        self._ephemeral_assets.pop(project_id, None)
+        self._ephemeral_tokens_data.pop(project_id, None)
+        self._ephemeral_workspace.pop(project_id, None)
+        if not self.bus.delete_project(project_id):
+            raise KeyError("Project not found")
+        await self.bus.emit("project_deleted", project_id, {"project_id": project_id})
 
     async def _log_timeline(
         self, state: ProjectState, actor: str, text: str, kind: str = "info"
@@ -270,7 +332,11 @@ class OfficeOrchestrator:
             state.target_source_dir
         )
         sys_inst = build_agent_system_instructions(agent_id, workspace_ctx)
-        skills_dir = str(Path(state.target_source_dir) / ".agents" / "skills")
+        skills_dir = (
+            str(Path(state.target_source_dir) / ".agents" / "skills")
+            if working_dir
+            else None
+        )
 
         state.token_stats.ai_calls_made += 1
         self._recompute_token_stats(state)
@@ -279,11 +345,29 @@ class OfficeOrchestrator:
             await self._update_agent(state, agent_id, thought=txt[:280])
 
         async def _on_tool(call: dict[str, Any]) -> None:
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            write_tools = {
+                "write_to_file",
+                "replace_file_content",
+                "multi_replace_file_content",
+                "write_file",
+                "edit_file",
+            }
+            edited = None
+            if call.get("name") in write_tools:
+                edited = (
+                    args.get("TargetFile")
+                    or args.get("AbsolutePath")
+                    or args.get("path")
+                    or args.get("file_path")
+                    or None
+                )
             await self._update_agent(
                 state,
                 agent_id,
                 bubble_text=f"🤖 {call['name']}",
                 tool_call=call,
+                edited_file=str(edited) if edited else None,
             )
 
         return await self.sdk_runner.run_task(
@@ -316,7 +400,7 @@ class OfficeOrchestrator:
             return
 
         project_dir = PROJECTS_DIR / project_id
-        figma_token = self._ephemeral_figma_tokens.get(project_id)
+        figma_token = self._resolve_figma_token(project_id)
         workspace_ctx = self._ephemeral_workspace.get(project_id) or inspect_workspace_context(
             state.target_source_dir
         )
@@ -362,7 +446,7 @@ class OfficeOrchestrator:
             self._recompute_token_stats(state, tokens_data)
             await self._log_timeline(
                 state,
-                "Minh (Leader)",
+                "Thiện (Leader)",
                 f"Đã trích xuất tokens.json offline (nén {tokens_data.get('stats', {}).get('compression_pct', 0)}% node rác, 0 token).",
                 "offline",
             )
@@ -401,6 +485,10 @@ class OfficeOrchestrator:
             )
             if state.mode == "live_sdk":
                 plan_prompt = (
+                    f"QUY TẮC BẮT BUỘC: KHÔNG gọi bất kỳ tool đọc/tìm file hay chạy lệnh nào "
+                    f"(KHÔNG view_file, list_dir, grep_search, find_by_name, run_command). "
+                    f"Toàn bộ dữ liệu Figma và Đặc tả đã có sẵn bên dưới — chỉ phân tích và trả về ngay "
+                    f"khối ```json ... ``` trong 1 lượt duy nhất.\n\n"
                     f"Phân tích theo thứ tự: DỰA TRÊN FIGMA TRƯỚC rồi đối chiếu với file đặc tả gốc.\n"
                     f"QUAN TRỌNG: Chỉ phân tích tập trung vào 2 nhóm chính:\n"
                     f"  1) Các mục trên Menu (scope='menu': Giới thiệu, Sản phẩm, Dịch vụ, Tin tức, Liên hệ...)\n"
@@ -426,14 +514,14 @@ class OfficeOrchestrator:
                     f'  "spec_global_features": ["Yêu cầu chung / SEO / Hotline / Mạng xã hội..."]\n'
                     f'}}\n'
                     f"Framework phát hiện: {workspace_ctx['framework']}\n"
-                    f"Các mục sơ bộ đã đối chiếu Figma → Đặc tả (hãy kiểm tra, phân tách/tinh chỉnh lại cho chuẩn):\n"
-                    f"{json.dumps([s.model_dump(mode='json') for s in state.spec_sections], ensure_ascii=False)[:3200]}\n\n"
-                    f"Đặc tả gốc:\n{state.spec_text[:3000]}\n\n"
-                    f"Figma Tokens:\n{json.dumps(tokens_data, ensure_ascii=False)[:2400]}"
+                    f"Các mục sơ bộ đã đối chiếu Figma → Đặc tả (GIỮ ĐẦY ĐỦ tất cả các mục, KHÔNG được bỏ sót Album, Thành tựu/Thống kê, Tiêu chí, Footer, hoặc các banner Quảng cáo nếu design có nhiều hơn 1):\n"
+                    f"{json.dumps([s.model_dump(mode='json') for s in state.spec_sections], ensure_ascii=False)[:12000]}\n\n"
+                    f"Đặc tả gốc:\n{state.spec_text[:6000]}\n\n"
+                    f"Figma Sections & Tokens:\n{json.dumps({'menu_items': tokens_data.get('menu_items', []), 'sections': tokens_data.get('sections', []), 'colors': tokens_data.get('colors', [])[:8], 'fonts': tokens_data.get('fonts', [])}, ensure_ascii=False)[:6000]}"
                 )
                 try:
                     leader_reply = await self._run_sdk_with_fallback(
-                        state, "leader", plan_prompt, state.target_source_dir
+                        state, "leader", plan_prompt, None
                     )
                     ai_sections, ai_global, md_override = parse_ai_sections_from_reply(
                         leader_reply,
@@ -534,7 +622,7 @@ class OfficeOrchestrator:
                     )
             await self._log_timeline(
                 state,
-                "Minh (Leader)",
+                "Thiện (Leader)",
                 "Đã phân tích xong đặc tả & chia 3 đầu việc dự kiến. Đang chờ bạn xem, chỉnh sửa và bấm Duyệt để giao xuống nhân viên.",
                 "warning",
             )
@@ -655,7 +743,7 @@ class OfficeOrchestrator:
 
         project_dir = PROJECTS_DIR / project_id
         preview_dir = project_dir / "preview_site"
-        figma_token = self._ephemeral_figma_tokens.get(project_id)
+        figma_token = self._resolve_figma_token(project_id)
         workspace_ctx = self._ephemeral_workspace.get(project_id) or inspect_workspace_context(
             state.target_source_dir
         )
@@ -702,14 +790,80 @@ class OfficeOrchestrator:
                 },
             )
 
-            file_key, _ = parse_figma_url(state.figma_url)
+            file_key, figma_node_id = parse_figma_url(state.figma_url)
+            font_source_dir = get_runtime_env("FONT_SOURCE_DIR", settings.FONT_SOURCE_DIR)
             assets_manifest = await run_asset_and_font_pipeline(
                 tokens_data,
                 preview_dir,
                 figma_file_key=file_key,
                 figma_token=figma_token,
+                font_source_dir=font_source_dir,
+                figma_node_id=figma_node_id,
+                ref_dir=project_dir / "_figma_ref",
             )
             self._ephemeral_assets[project_id] = assets_manifest
+            state.missing_fonts = list(assets_manifest.get("missing_fonts") or [])
+
+            # Sync generated fonts.css, .woff/.woff2 fonts & WebP/SVG assets into target source in Live mode
+            target_root = Path(state.target_source_dir) if state.target_source_dir else None
+            if state.mode == "live_sdk" and target_root and target_root.is_dir():
+                (target_root / "assets" / "css").mkdir(parents=True, exist_ok=True)
+                (target_root / "assets" / "images").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(
+                    preview_dir / "assets" / "css" / "fonts.css",
+                    target_root / "assets" / "css" / "fonts.css",
+                )
+                if assets_manifest.get("main_font"):
+                    upsert_root_fonts_in_style_css(
+                        target_root / "assets" / "css" / "style.css",
+                        str(assets_manifest["main_font"]),
+                        str(assets_manifest.get("heading_font") or assets_manifest["main_font"]),
+                    )
+                src_fonts_dir = preview_dir / "assets" / "fonts"
+                if src_fonts_dir.is_dir():
+                    shutil.copytree(
+                        src_fonts_dir,
+                        target_root / "assets" / "fonts",
+                        dirs_exist_ok=True,
+                    )
+                for rel_asset in [
+                    *assets_manifest.get("images", []),
+                    *assets_manifest.get("icons", []),
+                ]:
+                    src_file = preview_dir / rel_asset
+                    dst_file = target_root / rel_asset
+                    if src_file.is_file():
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+
+            # Configure Nasanic config/type-*.php based on approved spec_sections + Figma image sizes
+            use_real_config_dir = (
+                state.mode == "live_sdk"
+                and workspace_ctx["framework"] == "nasanic"
+                and target_root is not None
+                and (target_root / "config").is_dir()
+            )
+            config_target_dir = (
+                (target_root / "config")
+                if use_real_config_dir and target_root is not None
+                else (project_dir / "nasanic_config_preview")
+            )
+            config_summary = configure_nasanic_types(
+                config_target_dir,
+                state.spec_sections,
+                tokens_data,
+                assets_manifest,
+                state.spec_global_features,
+            )
+            ctrl_summary: dict[str, Any] = {"updated_files": [], "home_vars": [], "all_vars": []}
+            if use_real_config_dir and target_root is not None:
+                ctrl_summary = wire_nasanic_controllers(target_root, config_summary)
+            config_summary["controllers"] = ctrl_summary
+            (project_dir / "config_summary.json").write_text(
+                json.dumps(config_summary, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
             state.token_stats.offline_steps_completed += 2
             self._recompute_token_stats(state)
             await asyncio.sleep(self.step_delay)
@@ -718,14 +872,86 @@ class OfficeOrchestrator:
                 assets_manifest["fonts_css"],
                 *assets_manifest.get("images", []),
                 *assets_manifest.get("icons", []),
+                *config_summary.get("written_files", []),
+                *ctrl_summary.get("updated_files", []),
             ]
             await self._set_phase(state, "seeding")
-            seed_data = generate_demo_seed_data(state.name, approved_spec, tokens_data)
+            base_seed = generate_demo_seed_data(state.name, approved_spec, tokens_data)
+            ai_seed_override: dict[str, Any] | None = None
+            if state.mode == "live_sdk" and use_real_config_dir:
+                try:
+                    seed_prompt = (
+                        "KHÔNG gọi bất kỳ tool nào (NO read_file, NO run_command). Chỉ trả về DUY NHẤT một khối ```json ... ```.\n"
+                        "Nhiệm vụ: Tạo dữ liệu mẫu tiếng Việt chuẩn theo đúng thiết kế Figma & Đặc tả để seed vào MySQL Nasanic (kèm `options2` như `statistical`, `link-youtube`, `address` và `product_categories` nếu có).\n"
+                        f"Tên hợp đồng / công ty: {json.dumps(state.spec_metadata, ensure_ascii=False)}\n"
+                        f"Contact info từ Figma: {json.dumps(tokens_data.get('contact_info', {}), ensure_ascii=False)}\n"
+                        f"Sections & Text thực tế từ Figma: {json.dumps(tokens_data.get('sections', []), ensure_ascii=False)[:10000]}\n"
+                        f"Configured types (bao gồm options2_schema): {json.dumps(config_summary.get('configured_types', []), ensure_ascii=False)[:5000]}\n"
+                        "Trả về JSON dạng:\n"
+                        '{\n'
+                        '  "contact_info": {"company_name": "...", "hotline": "...", "email": "...", "address": "..."},\n'
+                        '  "product_categories": ["Bông", "Vải"],\n'
+                        '  "section_items": {\n'
+                        '    "<type_key>": [{"name": "...", "desc": "...", "options2": {"statistical": "10+", "address": "TP. HCM"}}]\n'
+                        '  }\n'
+                        '}'
+                    )
+                    seed_reply = await self.sdk_runner.run_task(
+                        system_instructions=build_agent_system_instructions("asset", workspace_ctx),
+                        prompt=seed_prompt,
+                        working_dir=None,
+                    )
+                    m_json = re.search(r"```json\s*([\s\S]*?)```", seed_reply)
+                    raw_j = m_json.group(1) if m_json else seed_reply
+                    parsed_j = json.loads(raw_j.strip())
+                    if isinstance(parsed_j, dict):
+                        ai_seed_override = parsed_j
+                except Exception:
+                    ai_seed_override = None
+
+            seed_data = build_figma_and_ai_seed_data(
+                tokens_data,
+                config_summary,
+                state.name,
+                base_seed,
+                ai_seed_override=ai_seed_override,
+                spec_metadata=state.spec_metadata,
+            )
             data_dir = preview_dir / "data"
             data_dir.mkdir(parents=True, exist_ok=True)
             (data_dir / "seed.json").write_text(
                 json.dumps(seed_data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            seed_db_summary: dict[str, Any] = {"seeded": [], "skipped_existing": [], "warnings": []}
+            if use_real_config_dir and target_root is not None:
+                seed_db_summary = seed_nasanic_database(
+                    target_root,
+                    state.name,
+                    config_summary,
+                    preview_dir / "assets",
+                    seed_data,
+                    replace_template_data=True,
+                )
+                (project_dir / "seed_summary.json").write_text(
+                    json.dumps(seed_db_summary, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+            if state.missing_fonts:
+                await self._log_timeline(
+                    state,
+                    "Linh (Assets & Config)",
+                    f"⚠️ Thiếu font chưa có trên Google Fonts hay {font_source_dir}: {', '.join(state.missing_fonts)}. Hãy thêm file font (.woff/.woff2/.ttf/.otf) vào {font_source_dir} hoặc assets/fonts/!",
+                    "warning",
+                )
+            if seed_db_summary.get("seeded") or seed_db_summary.get("skipped_existing"):
+                await self._log_timeline(
+                    state,
+                    "Linh (Assets & Config)",
+                    f"DB Seed: đã nhập {len(seed_db_summary['seeded'])} mục mới, bỏ qua {len(seed_db_summary['skipped_existing'])} mục đã có dữ liệu.",
+                    "offline",
+                )
+
             state.tasks[0].output_files = [*state.tasks[0].output_files, "data/seed.json"]
             state.token_stats.offline_steps_completed += 1
             self._recompute_token_stats(state)
@@ -733,13 +959,19 @@ class OfficeOrchestrator:
                 state,
                 "asset",
                 status="working_offline",
-                bubble_text="⚡ Sinh seed.json & hoàn tất Config...",
+                bubble_text="⚡ Cấu hình config/type, seed.json & WebP...",
                 edited_file="assets/css/fonts.css",
                 thought=(
-                    f"Phát hiện `{workspace_ctx['framework']}`. Đã sinh `fonts.css`, "
-                    f"{len(assets_manifest.get('images', []))} ảnh WebP và seed data theo đặc tả đã duyệt (0 token)."
+                    f"Phát hiện `{workspace_ctx['framework']}`. Đã cấu hình {len(config_summary.get('configured_types', []))} "
+                    f"mục `config/type-*.php` theo đặc tả + kích thước ảnh Figma, sinh `fonts.css`, "
+                    f"{len(assets_manifest.get('images', []))} ảnh WebP và `seed.json` (0 token)."
                 ),
             )
+            for cfg_file in [
+                *config_summary.get("written_files", []),
+                *ctrl_summary.get("updated_files", []),
+            ]:
+                await self._update_agent(state, "asset", edited_file=cfg_file)
             await self._update_agent(state, "asset", edited_file="data/seed.json")
             await asyncio.sleep(self.step_delay)
             state.tasks[0].status = "done"
@@ -750,7 +982,13 @@ class OfficeOrchestrator:
                 "offline",
             )
             await self._handoff_to_leader_and_relax(
-                state, "asset", "Xong Config, WebP/Font & Seed"
+                state,
+                "asset",
+                (
+                    f"⚠️ Thiếu font: {', '.join(state.missing_fonts)}"
+                    if state.missing_fonts
+                    else "Xong Config, WebP/Font & Seed"
+                ),
             )
 
             # ------------------------------------------------------------------
@@ -765,29 +1003,91 @@ class OfficeOrchestrator:
                 status="working_ai",
                 execution_kind="ai",
                 current_task=state.tasks[1].title,
-                bubble_text="🤖 AI: Code HTML/Blade, Vanilla CSS & Responsive...",
-                edited_file="index.html",
+                bubble_text="🤖 AI: Code Blade, Vanilla CSS & Responsive...",
+                edited_file=(
+                    "src/Views/templates/home/index.blade.php"
+                    if workspace_ctx["framework"] == "nasanic"
+                    else "index.html"
+                ),
             )
 
             if state.mode == "live_sdk":
+                figma_line = f"- Link Figma: `{state.figma_url}`\n" if state.figma_url else ""
+                ref_images = assets_manifest.get("reference_images") or []
+                ref_line = (
+                    "- Ảnh chụp màn hình thiết kế Figma (BẮT BUỘC dùng `read_file` xem TẤT CẢ các ảnh này trước khi viết HTML/CSS): "
+                    + ", ".join(f"`{p}`" for p in ref_images)
+                    + "\n"
+                    if ref_images
+                    else (
+                        f"- Chưa có ảnh chụp sẵn: BẮT BUỘC gọi MCP `download_figma_images` để tải PNG frame chính & các section lớn từ `{state.figma_url}` vào `{project_dir / '_figma_ref'}` rồi dùng `read_file` xem trực tiếp trước khi code!\n"
+                        if state.figma_url
+                        else ""
+                    )
+                )
+                ctrl_vars_json = json.dumps(
+                    {
+                        "home_vars": ctrl_summary.get("home_vars", []),
+                        "all_vars": ctrl_summary.get("all_vars", []),
+                    },
+                    ensure_ascii=False,
+                )
+                skill_files: list[str] = []
+                if state.target_source_dir:
+                    ws_root = Path(state.target_source_dir)
+                    for rel_skill in (
+                        ".agents/AGENTS.md",
+                        ".agents/skills/figma-to-nasanic-ui/SKILL.md",
+                    ):
+                        if (ws_root / rel_skill).is_file():
+                            skill_files.append(str(ws_root / rel_skill))
+                skill_line = (
+                    "- Skill & Quy chuẩn dự án (BẮT BUỘC `read_file` và tuân thủ trước khi code): "
+                    + ", ".join(f"`{p}`" for p in skill_files)
+                    + "\n"
+                    if skill_files
+                    else ""
+                )
+                container_w = int(tokens_data.get("container_width") or 1200)
                 dev_prompt = (
-                    f"Triển khai giao diện HTML/Blade, Vanilla CSS (`assets/css/style.css`, `assets/css/media.css`) "
-                    f"và JS (`assets/js/apps.js`) chuẩn dự án {workspace_ctx['framework']}.\n"
+                    f"Triển khai giao diện thật trực tiếp trong thư mục dự án `{state.target_source_dir}` (framework: `{workspace_ctx['framework']}`).\n"
                     f"ĐẶC TẢ ĐÃ DUYỆT:\n{approved_spec}\n\n"
-                    f"File đặc tả từng mục (loại sản phẩm/bài viết, 1/nhiều bài, cấp danh mục): `{project_dir / 'spec_sections.json'}`\n"
-                    f"Tài nguyên Linh đã tạo sẵn trong `{preview_dir}`:\n"
-                    f"- Font CSS: `{assets_manifest['fonts_css']}` (Fonts: {', '.join(tokens_data.get('fonts', []))})\n"
-                    f"- Ảnh WebP: {', '.join(assets_manifest.get('images', []))}\n"
+                    f"NGUỒN DỮ LIỆU & CẤU HÌNH ĐÃ CHUẨN BỊ SẴN:\n"
+                    f"{skill_line}"
+                    f"{figma_line}"
+                    f"{ref_line}"
+                    f"- Đặc tả từng mục (Menu + Mục lớn Trang chủ): `{project_dir / 'spec_sections.json'}`\n"
+                    f"- Cấu hình `config/type-*.php` & kích thước ảnh Figma: `{project_dir / 'config_summary.json'}`\n"
+                    f"- Biến dữ liệu Linh đã nối sẵn trong `HomeController.php` & `AllController.php`: {ctrl_vars_json}\n"
+                    f"- Font CSS đã cài sẵn (đã `@import` Google Fonts / `.woff2` local): `assets/css/fonts.css` (Fonts: {', '.join(tokens_data.get('fonts', []))})\n"
+                    f"- Ảnh WebP đã xuất: {', '.join(assets_manifest.get('images', []))}\n"
                     f"- Icons SVG: {', '.join(assets_manifest.get('icons', []))}\n"
-                    f"- Seed data: `{preview_dir / 'data' / 'seed.json'}`\n"
-                    f"Source gốc: `{state.target_source_dir}`.\n"
-                    f"Tokens màu: {json.dumps(tokens_data.get('colors', [])[:6], ensure_ascii=False)}\n"
-                    f"Đảm bảo breakpoint 1199/992/767/575/400 và không tràn ngang."
+                    f"- Bảng màu Figma Tokens: {json.dumps(tokens_data.get('colors', [])[:6], ensure_ascii=False)}\n"
+                    f"- Chiều rộng khung nội dung `.wrap-content` phát hiện từ Figma: `{container_w}px` (kiểm tra lại qua `get_figma_data`)\n\n"
+                    f"QUY TẮC TRIỂN KHAI BẮT BUỘC:\n"
+                    f"0. NHÌN DESIGN TRƯỚC KHI CODE: Dùng `read_file` xem hết các ảnh PNG Figma tham chiếu ở trên + gọi `get_figma_data` (`depth: 4`, KHÔNG dùng `depth: 2`) cho từng section để lấy đúng màu nền, gradient, bo góc, `font-size`, kích thước, khoảng cách (`padding`/`margin`/`gap`), bố cục flex. CHỈ render các section có thật trên ảnh Figma (KHÔNG tự thêm section không có trên Figma như Giới thiệu hay Dịch vụ nếu design không có; nếu Figma là Quảng cáo 2 thì render `$ads2`, KHÔNG chế thành Dịch vụ). Nếu trên Figma là hình ảnh hoặc SVG (icon, tiêu đề đồ họa, họa tiết, nền) thì BẮT BUỘC xuất qua `download_figma_images` và dùng ảnh/SVG đó — TUYỆT ĐỐI KHÔNG thay bằng chữ text hay icon FontAwesome. KHÔNG dùng `wow fadeInUp` hay `data-wow-duration`. KHÔNG dùng `<marquee>` hoặc CSS animation marquee khi đặc tả không yêu cầu.\n"
+                    f"1. Với Nasanic: KHÔNG SỬA `src/Views/templates/layout/slider.blade.php` (giữ nguyên slideshow gốc của source mẫu). Chỉ sửa `src/Views/templates/layout/header.blade.php`, `menu.blade.php`, `footer.blade.php`, `src/Views/templates/home/index.blade.php` và CSS/JS tại `assets/css/style.css`, `assets/css/media.css`, `assets/js/apps.js`. Viết lại sạch sẽ CSS theo đúng Figma. Quy tắc CSS bắt buộc:\n"
+                    f"   - KHÔNG CSS TRÙNG / CẨN THẬN CSS CŨ: Đọc kỹ toàn bộ `assets/css/style.css` và `assets/css/media.css` hiện có trước khi sửa; sửa trực tiếp vào selector cũ hoặc xóa hẳn block CSS/section mẫu cũ không dùng nữa — TUYỆT ĐỐI KHÔNG append thêm block mới trùng selector ở cuối file gây lặp hoặc đè chéo CSS.\n"
+                    f"   - `:root` ở đầu `assets/css/style.css` CHỈ khai báo `--color-main` và `--font-main`, KHÔNG thêm các biến `:root` thừa khác.\n"
+                    f"   - `.wrap-content` set đúng `max-width` theo container width trên Figma (vd `{container_w}px`), không để nguyên `1200px` của mẫu nếu Figma khác.\n"
+                    f"   - Menu: giữ nguyên CSS của `.menu li ul` từ source mẫu, KHÔNG CSS lại từ `.menu li ul` trở xuống.\n"
+                    f"   - Danh sách sản phẩm: BẮT BUỘC dùng `<div class=\"row-product row row-cols-2 row-cols-sm-2 row-cols-md-3 row-cols-lg-4\">@foreach ($product as $v)<div class=\"col-product col\">{{!! render_product_item($v, $lang, $sluglang) !!}}</div>@endforeach</div>`, KHÔNG dùng `display: grid`; CSS card sản phẩm dùng chung cho toàn trang xài `render_product_item`.\n"
+                    f"   - Heading: nếu dùng danh mục cấp thì phải dùng `<h2>` (không dùng `<h3>`); `<h3>` dùng cho tên sản phẩm.\n"
+                    f"   - Hình ảnh & SVG: KHÔNG set cứng chiều cao (`height`) cho hình ảnh sản phẩm/bài viết trong CSS (`height: auto`), giữ đúng tỷ lệ tự nhiên theo `render_image`; ưu tiên dùng file `.svg` đã xuất từ Figma trong `assets/images/` (hoặc gọi `download_figma_images` lấy SVG từ Figma), không tự vẽ lại icon hay thay bằng FontAwesome.\n"
+                    f"   - KHÔNG set dữ liệu mẫu cứng trong UI/Blade: chỉ render từ biến Controller truyền sang, không tự gán mảng/text mẫu giả lập.\n"
+                    f"   - Khối Quảng cáo (`$ads`, `$ads2`) chỉ hiển thị hình ảnh thuần từ `render_image`, TUYỆT ĐỐI KHÔNG CSS chữ hay nút đè lên hình quảng cáo.\n"
+                    f"2. Dùng ĐÚNG tên biến Controller tiếng Anh đã nối sẵn ở trên (`$products`, `$criteria`, `$news`, `$albums`, `$achievements`, `$ads`, `$ads2`, `$sloganProducts`...), helper `render_image([...])`, `Func::decodeHtmlChars(...)`, carousel `splide-auto`. TUYỆT ĐỐI KHÔNG viết fallback biến sang biến khác hay gán giá trị mặc định trong Blade (vd: cấm `$x = $products ?? $hotProducts`, cấm `?? 'text mặc định'`); nếu biến rỗng thì không render. Với các text cố định lấy trực tiếp từ Figma thì ghi thẳng text từ Figma, KHÔNG cần bọc `__('web....')`.\n"
+                    f"3. KHÔNG hardcode slogan hay mô tả nhỏ của section trong Blade nếu có biến `$slogan*` tương ứng trong `ctrl_summary` — lấy từ biến `$slogan*` hoặc `$slogan` trong Admin.\n"
+                    f"4. Trong `footer.blade.php`, khối thông tin công ty / địa chỉ / hotline / email BẮT BUỘC render thẳng từ `{{!! Func::decodeHtmlChars($footer['content' . $lang] ?? '') !!}}` (để khách tự sửa trong CKEditor mục Footer), KHÔNG đọc tách từng trường `$setting`/`$optSetting` rồi CSS từng dòng.\n"
+                    f"5. CẤM dùng `aspect-ratio`, CẤM đưa Tailwind vào CSS, không đặt `min-width` lớn gây tràn ngang.\n"
+                    f"6. Responsive đầy đủ tại các breakpoint `1199px`, `992px`, `767px`, `575px`, `400px`."
                 )
                 try:
                     await self._run_sdk_with_fallback(
                         state, "dev", dev_prompt, state.target_source_dir
                     )
+                    if target_root and target_root.is_dir():
+                        convert_workspace_images_to_webp(target_root)
                 except Exception as sdk_exc:
                     await self._handle_sdk_error(state, "dev", sdk_exc)
                     return
@@ -1225,7 +1525,8 @@ class OfficeOrchestrator:
     async def _handle_sdk_error(
         self, state: ProjectState, agent_id: str, exc: Exception
     ) -> None:
-        msg = f"Antigravity SDK báo lỗi: {exc}. Bạn có thể kiểm tra đăng nhập SDK hoặc chuyển sang chế độ Demo."
+        detail = f"{type(exc).__name__}: {exc}" if str(exc).strip() else type(exc).__name__
+        msg = f"Antigravity CLI (agy) báo lỗi: {detail}. Kiểm tra cài đặt/đăng nhập agy CLI hoặc chuyển sang chế độ Demo."
         state.agents[agent_id].chat_history.append(
             {"sender": "system", "text": msg, "timestamp": utc_now_iso()}
         )
@@ -1233,7 +1534,7 @@ class OfficeOrchestrator:
             state,
             agent_id,
             status="blocked",
-            bubble_text="🔴 SDK bị chặn/lỗi auth",
+            bubble_text="🔴 agy CLI lỗi/chưa sẵn sàng",
             thought=msg,
         )
         state.phase = "failed"

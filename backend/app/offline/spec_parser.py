@@ -196,13 +196,19 @@ def classify_spec_item(name: str, description: str) -> dict[str, Any]:
     content_type = "feature"
     item_cardinality = "none"
 
-    if any(k in norm_name for k in ("header", "banner", "hero", "slide", "slider", "footer", "trang chu")):
+    if re.search(r"\b(?:qc|quang\s*cao|quangcao|banner)\b", norm_name):
+        content_type = "layout"
+        item_cardinality = "multiple"
+    elif any(k in norm_name for k in ("header", "hero", "slide", "slider", "footer", "trang chu")):
         content_type = "layout"
         item_cardinality = "none"
-    elif any(k in norm_name for k in ("tieu chi", "vi sao chon")):
+    elif any(k in norm_name for k in ("tieu chi", "vi sao", "tai sao")):
         content_type = "feature"
         item_cardinality = "multiple"
-    elif any(k in norm_name for k in ("gioi thieu", "ve chung toi")) or norm_name.startswith("ve "):
+    elif any(k in norm_name for k in ("y kien", "cam nhan", "khach hang")):
+        content_type = "article_list"
+        item_cardinality = "multiple"
+    elif any(k in norm_name for k in ("gioi thieu", "ve chung toi", "tuyen dung")) or norm_name.startswith("ve "):
         content_type = "article_single"
         item_cardinality = "single"
     elif re.search(r"\b(?:1|mot)\s+bai\s+viet\b|\bbai\s+viet\s+don\b", combined):
@@ -283,6 +289,7 @@ _METADATA_KEYS = {
     "link demo": "demo_url",
     "chuc nang": "package_features",
     "loai website": "package_features",
+    "loai web": "package_features",
 }
 
 _NOISE_PREFIXES = (
@@ -296,10 +303,14 @@ _NOISE_PREFIXES = (
     "thong tin hop dong",
     "thong tin lien he",
     "thong tin quan ly",
+    "trang web tuong tu",
+    "du lieu chuyen het",
+    "nvpt",
     "ten nvkd",
     "nv design",
     "mail - sdt",
     "mail – sdt",
+    "mail ql - sdt",
     "mail kd",
     "mail ql",
     "mail tkv",
@@ -542,23 +553,57 @@ def parse_structured_spec(spec_text: str) -> dict[str, Any]:
                 in_global_section = False
                 continue
 
-            # Distinguish STT + Name + Desc vs Name + Desc
-            col0 = cells[0] if len(cells) > 0 else ""
-            is_stt = bool(re.fullmatch(r"\d+(?:\.\d+)?", col0)) or (col0 == "" and len(cells) >= 3)
-            if is_stt:
-                sec_name = cells[1] if len(cells) > 1 else ""
-                sec_desc = cells[2] if len(cells) > 2 else ""
-                feedback = " / ".join(c for c in cells[3:] if c)
+            # Distinguish STT + Name + Desc while preserving empty middle cells like `2 | | Trang chủ ... | OK`
+            # and empty STT slots like `| | 1. Fanpage ... | OK`, plus `| 4 | MENU ...` and `7 | 8 | MENU ...`.
+            first_ne_idx = next((idx for idx, c in enumerate(cells) if c), -1)
+            if first_ne_idx >= 0 and re.fullmatch(r"\d+(?:\.\d+)?", cells[first_ne_idx]):
+                after_stt_idx = first_ne_idx + 1
+                if after_stt_idx < len(cells) and cells[after_stt_idx] and re.fullmatch(r"\d+(?:\.\d+)?", cells[after_stt_idx]):
+                    after_stt_idx += 1
+                tail = cells[after_stt_idx:]
+                sec_name = tail[0] if len(tail) > 0 else ""
+                sec_desc = tail[1] if len(tail) > 1 else ""
+                fb_list = [c for c in tail[2:] if c and _normalize_vn(c) not in {"ok", "f"}]
+            elif len(cells) >= 3 and not cells[0] and not cells[1]:
+                # Continuation row without STT, e.g. ` | | 1. Fanpage và Zalo | OK`
+                rem = [c for c in cells[2:] if c]
+                sec_name = ""
+                sec_desc = rem[0] if len(rem) > 0 else ""
+                fb_list = [c for c in rem[1:] if c and _normalize_vn(c) not in {"ok", "f"}]
             else:
                 sec_name = cells[0]
                 sec_desc = cells[1] if len(cells) > 1 else ""
-                feedback = " / ".join(c for c in cells[2:] if c)
+                fb_list = [c for c in cells[2:] if c and _normalize_vn(c) not in {"ok", "f"}]
+            feedback = " / ".join(fb_list)
 
             if not sec_name and not sec_desc:
                 continue
 
             norm_sec = _normalize_vn(sec_name).rstrip(":")
             if any(norm_sec.startswith(p) for p in _NOISE_PREFIXES):
+                continue
+
+            # Rows like "TREN DIEN THOAI" or "BANNER CHO MENU" -> global instruction
+            if norm_sec == "tren dien thoai":
+                if sec_desc:
+                    add_global(f"Mobile: {sec_desc}")
+                continue
+            if "banner cho menu" in norm_sec:
+                add_global(f"Banner cho menu: {sec_desc}".strip())
+                continue
+
+            # Rows like "MENU GIỚI THIỆU", "MENU SẢN PHẨM", "MENU DỊCH VỤ", ...
+            if re.match(r"^menu\s+", norm_sec) and len(norm_sec) > 5:
+                clean_menu_name = re.sub(r"^menu\s+", "", sec_name.strip(), flags=re.IGNORECASE).strip()
+                clean_menu_name = clean_menu_name.title() if clean_menu_name.isupper() else clean_menu_name
+                add_item(clean_menu_name, sec_desc, "menu", feedback)
+                norm_desc_low = _normalize_vn(sec_desc)
+                # If spec says "... ra ngoài trang chủ" AND does NOT say "không cần lấy dữ liệu...", link homepage too
+                if (
+                    ("ra ngoai trang chu" in norm_desc_low or "ngoai trang chu" in norm_desc_low)
+                    and "khong can lay du lieu" not in norm_desc_low
+                ):
+                    add_item(clean_menu_name, sec_desc, "homepage", feedback)
                 continue
 
             # Rows like "Cho nhiều Hiệu ứng trình bày. | | Lưu ý: TỐI ƯU HÓA..."
@@ -634,10 +679,12 @@ def parse_structured_spec(spec_text: str) -> dict[str, Any]:
 _SYNONYM_GROUPS: list[set[str]] = [
     {"header", "navigation", "nav", "topbar", "banner", "logo"},
     {"hero", "slide", "slider", "carousel", "trang chu"},
-    {"about", "gioi thieu", "ve chung toi", "ve", "uy tin", "cam ket"},
-    {"product", "san pham", "menu", "dich vu", "bang gia", "goi", "noi bat"},
+    {"about", "gioi thieu", "ve chung toi", "uy tin", "cam ket"},
+    {"product", "san pham", "nhom sp", "menu", "dich vu", "bang gia", "goi", "noi bat"},
+    {"vi sao", "tieu chi", "tai sao"},
+    {"y kien", "cam nhan", "goc nhin tu khach hang", "khach hang"},
     {"dao tao", "training", "khoa hoc"},
-    {"album", "thu vien", "hinh anh", "khach hang", "gallery"},
+    {"album", "thu vien", "hinh anh", "gallery"},
     {"video", "clip", "mp4", "youtube"},
     {"tin tuc", "blog", "bai viet", "uu dai", "news", "cam on"},
     {"footer", "lien he", "dat lich", "tu van", "contact", "form"},
@@ -645,9 +692,13 @@ _SYNONYM_GROUPS: list[set[str]] = [
 
 
 def _match_score(figma_name: str, spec_item: dict[str, Any]) -> int:
-    f_norm = _normalize_vn(figma_name)
-    s_norm = _normalize_vn(spec_item.get("name", ""))
+    f_norm = re.sub(r"[_#-]+", " ", _normalize_vn(figma_name)).strip()
+    s_norm = re.sub(r"[_#-]+", " ", _normalize_vn(spec_item.get("name", ""))).strip()
     if not f_norm or not s_norm:
+        return 0
+    f_is_ad = bool(re.search(r"\b(?:qc|quang\s*cao|quangcao|banner)\b", f_norm))
+    s_is_ad = bool(re.search(r"\b(?:qc|quang\s*cao|quangcao|banner)\b", s_norm))
+    if f_is_ad != s_is_ad:
         return 0
     if f_norm == s_norm:
         return 100
@@ -842,12 +893,26 @@ def reconcile_figma_and_spec(tokens_data: dict[str, Any], spec_text: str) -> dic
                 ),
             )
 
+    menu_slugs_emitted = {
+        _normalize_vn(s["name"].removeprefix("Menu: "))
+        for s in sections_out
+        if s.get("scope") == "menu"
+    }
+    strict_figma_homepage = tokens_data.get("source") == "figma_api" and len(figma_sections) >= 3
     for idx, item in enumerate(spec_items):
         if idx in used_indices:
             continue
+        item_scope = item.get("scope", "homepage")
+        item_slug = _normalize_vn(item["name"])
+        # If Figma homepage sections are available, do not invent extra homepage sections
+        # (like Dịch vụ / Giới thiệu) that do not appear on the Figma homepage.
+        if strict_figma_homepage and item_scope == "homepage":
+            continue
+        if figma_sections and item_scope == "homepage" and item_slug in menu_slugs_emitted:
+            continue
         _emit_section(
             name=item["name"],
-            scope=item.get("scope", "homepage"),
+            scope=item_scope,
             source="spec_only",
             figma_name="",
             content_type=item.get("content_type", "feature"),

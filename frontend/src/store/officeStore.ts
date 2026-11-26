@@ -34,6 +34,8 @@ interface OfficeStore {
   fetchProjects: () => Promise<void>;
   connectWebSocket: () => void;
   createProject: (payload: ProjectCreatePayload) => Promise<ProjectState | null>;
+  retryProject: (projectId: string) => Promise<void>;
+  deleteProject: (projectId: string) => Promise<void>;
   approveLeaderPlan: (projectId: string, req: PlanApprovalRequest) => Promise<void>;
   submitBugReview: (projectId: string, req: BugReviewRequest) => Promise<void>;
   sendAgentChat: (projectId: string, agentId: string, message: string) => Promise<void>;
@@ -169,6 +171,20 @@ export const useOfficeStore = create<OfficeStore>((set, get) => ({
           return;
         }
 
+        if (msg.type === "project_deleted" && msg.project_id) {
+          set((s) => {
+            const remaining = s.projects.filter((p) => p.id !== msg.project_id);
+            return {
+              projects: remaining,
+              activeProjectId:
+                s.activeProjectId === msg.project_id
+                  ? remaining[0]?.id ?? null
+                  : s.activeProjectId,
+            };
+          });
+          return;
+        }
+
         if (msg.type === "agent_update" && msg.project_id && msg.payload.agent) {
           const agent = msg.payload.agent as AgentState;
           set((s) => ({
@@ -215,6 +231,60 @@ export const useOfficeStore = create<OfficeStore>((set, get) => ({
         lastError: e instanceof Error ? e.message : "Không thể tạo dự án",
       });
       return null;
+    }
+  },
+
+  retryProject: async (projectId) => {
+    set({ isSubmitting: true, lastError: null, isBreakTime: false });
+    try {
+      const res = await fetch(`/api/projects/${projectId}/retry`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Retry project failed" }));
+        throw new Error(err.detail || "Retry project failed");
+      }
+      const updated = (await res.json()) as ProjectState;
+      set((s) => ({
+        projects: upsertProject(s.projects, updated),
+        activeProjectId: updated.id,
+        showPlanReview: false,
+        showBugBoard: false,
+        _lastAutoPlanKey: null,
+        _lastAutoBugKey: null,
+        isSubmitting: false,
+      }));
+    } catch (e) {
+      set({
+        isSubmitting: false,
+        lastError: e instanceof Error ? e.message : "Không thể chạy lại dự án",
+      });
+    }
+  },
+
+  deleteProject: async (projectId) => {
+    set({ isSubmitting: true, lastError: null });
+    try {
+      const res = await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Delete project failed" }));
+        throw new Error(err.detail || "Delete project failed");
+      }
+      set((s) => {
+        const remaining = s.projects.filter((p) => p.id !== projectId);
+        return {
+          projects: remaining,
+          activeProjectId:
+            s.activeProjectId === projectId ? remaining[0]?.id ?? null : s.activeProjectId,
+          showPlanReview: false,
+          showBugBoard: false,
+          showPreviewDrawer: false,
+          isSubmitting: false,
+        };
+      });
+    } catch (e) {
+      set({
+        isSubmitting: false,
+        lastError: e instanceof Error ? e.message : "Không thể xóa dự án",
+      });
     }
   },
 

@@ -111,6 +111,24 @@ async def create_project(req: ProjectCreate) -> dict:
     return state.model_dump(mode="json")
 
 
+@app.post("/api/projects/{project_id}/retry")
+async def retry_project(project_id: str) -> dict:
+    try:
+        state = await orchestrator.retry_project(project_id)
+        return state.model_dump(mode="json")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str) -> dict:
+    try:
+        await orchestrator.delete_project(project_id)
+        return {"ok": True, "deleted": project_id}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
 @app.post("/api/projects/{project_id}/plan/approve")
 async def approve_plan(project_id: str, req: PlanApprovalRequest) -> dict:
     try:

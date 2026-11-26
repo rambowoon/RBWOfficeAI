@@ -27,8 +27,14 @@ def run_static_checks(site_root: Path, is_nasanic: bool = True) -> tuple[list[di
         return bugs, notes
 
     css_files = list(site_root.glob("assets/css/*.css"))
+    vendor_css_prefixes = ("bootstrap", "splide", "fancybox", "animate", "mmenu", "tailwind")
     for css_file in css_files:
-        if css_file.name == "fonts.css":
+        low_name = css_file.name.lower()
+        if (
+            low_name in {"fonts.css", "style-tailwind.css"}
+            or low_name.endswith(".min.css")
+            or low_name.startswith(vendor_css_prefixes)
+        ):
             continue
         notes["css_files_checked"] += 1
         rel_path = str(css_file.relative_to(site_root)).replace("\\", "/")
@@ -162,7 +168,28 @@ def _run_playwright_sync(
                 )
 
                 page.goto(preview_url, wait_until="networkidle", timeout=25000)
-                page.wait_for_timeout(300)
+                page.evaluate(
+                    """async () => {
+                      const imgs = Array.from(document.querySelectorAll('img'));
+                      for (const img of imgs) {
+                        if (img.loading === 'lazy') img.loading = 'eager';
+                      }
+                      window.scrollTo(0, document.body.scrollHeight);
+                      await new Promise(r => setTimeout(r, 250));
+                      window.scrollTo(0, 0);
+                      await Promise.all(
+                        imgs.map(img => {
+                          if (img.complete) return Promise.resolve();
+                          return new Promise(resolve => {
+                            const timer = setTimeout(resolve, 4000);
+                            img.addEventListener('load', () => { clearTimeout(timer); resolve(); }, { once: true });
+                            img.addEventListener('error', () => { clearTimeout(timer); resolve(); }, { once: true });
+                          });
+                        })
+                      );
+                    }"""
+                )
+                page.wait_for_timeout(200)
 
                 shot_filename = f"round{qa_round}_{vp_name}.png"
                 shot_path = artifacts_dir / shot_filename
@@ -175,7 +202,16 @@ def _run_playwright_sync(
                       const doc = document.documentElement;
                       const overflowPx = Math.max(0, doc.scrollWidth - window.innerWidth);
                       const brokenImgs = Array.from(document.querySelectorAll('img'))
-                        .filter(img => !img.complete || img.naturalWidth === 0)
+                        .filter(img => {
+                          const src = img.getAttribute('src') || '';
+                          if (!src) return false;
+                          const style = window.getComputedStyle(img);
+                          if (style.display === 'none' || style.visibility === 'hidden') return false;
+                          if (img.offsetParent === null && style.position !== 'fixed') return false;
+                          const r = img.getBoundingClientRect();
+                          if (r.width === 0 && r.height === 0) return false;
+                          return img.complete && img.naturalWidth === 0;
+                        })
                         .map(img => img.getAttribute('src') || 'unknown');
                       let off offender = '';
                       if (overflowPx > 1) {

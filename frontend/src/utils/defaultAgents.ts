@@ -2,7 +2,7 @@ import type { AgentState } from "../types";
 
 export function buildFallbackAgents(): Record<string, AgentState> {
   const defs: Array<{ id: string; name: string; role: AgentState["role"]; title: string }> = [
-    { id: "leader", name: "Minh (Leader)", role: "leader", title: "Tech Lead & Architect" },
+    { id: "leader", name: "Thiện (Leader)", role: "leader", title: "Tech Lead & Architect" },
     { id: "asset", name: "Linh (Assets & Config)", role: "asset", title: "Config, Font/WebP & Seed" },
     { id: "dev", name: "Vy (UI & Frontend)", role: "dev", title: "HTML/Blade, CSS & Responsive" },
     { id: "qa", name: "Tuấn (QA & Tester)", role: "qa", title: "Static & Playwright QA" },

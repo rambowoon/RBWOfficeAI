@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 from fastapi import WebSocket
 
-from .config import PROJECTS_DIR
+from .config import ARTIFACTS_DIR, PROJECTS_DIR
 from .models import ProjectState, utc_now_iso
 
 
@@ -45,6 +46,14 @@ class EventBus:
 
     def get_project(self, project_id: str) -> ProjectState | None:
         return self._projects.get(project_id)
+
+    def delete_project(self, project_id: str) -> bool:
+        existed = project_id in self._projects
+        self._projects.pop(project_id, None)
+        for folder in (PROJECTS_DIR / project_id, ARTIFACTS_DIR / project_id):
+            if folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+        return existed
 
     def save_project(self, state: ProjectState) -> None:
         state.updated_at = utc_now_iso()

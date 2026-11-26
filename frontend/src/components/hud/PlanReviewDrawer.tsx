@@ -324,7 +324,7 @@ export function PlanReviewDrawer() {
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <ClipboardCheck size={18} color="#38bdf8" />
               <strong style={{ fontSize: 16 }}>
-                Đặc tả phân tích của Minh (Leader)
+                Đặc tả phân tích của Thiện (Leader)
               </strong>
               <span
                 style={{
@@ -719,21 +719,6 @@ export function PlanReviewDrawer() {
                   <span>Thêm mục đặc tả</span>
                 </button>
               )}
-
-              {/* Global Features */}
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd", marginBottom: 6 }}>
-                  Chức năng chung & Yêu cầu SEO / Kỹ thuật (mỗi dòng 1 yêu cầu)
-                </div>
-                <textarea
-                  rows={4}
-                  readOnly={!isWaitingPlan}
-                  value={specGlobalText}
-                  onChange={(e) => setSpecGlobalText(e.target.value)}
-                  placeholder="Ví dụ: Icon Zalo/Mess/Hotline, Tối ưu ảnh WebP, SEO thẻ H1/H2/H3, sitemap.xml..."
-                  style={{ ...fieldStyle, resize: "vertical", fontSize: 11.5, lineHeight: 1.5 }}
-                />
-              </div>
             </>
           ) : (
             <div>
